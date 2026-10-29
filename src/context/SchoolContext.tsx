@@ -345,7 +345,7 @@ interface SchoolContextType {
     average: number;
     totalScore: number;
   }>;
-  dispatchCollatedResultsToDashboards: (options?: {
+  dispatchCollatedResultsToDashboards: (options?: string | {
     reportKind?: 'mid' | 'end';
     customMessage?: string;
     broadcastMessage?: string;
@@ -2746,6 +2746,11 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     );
   });
 
+  const latestStudentsRef = useRef<StudentProfile[]>(students);
+  useEffect(() => {
+    latestStudentsRef.current = students;
+  }, [students]);
+
   const [activeStudentId, setActiveStudentId] = useState<string>(() => {
     try {
       return sessionStorage.getItem('stanbax_student_id') || localStorage.getItem('stanbax_student_id') || DEMO_STUDENT.id;
@@ -3687,8 +3692,10 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     const deduplicatedRecords = Array.from(mergedIncomingMap.values());
 
-    // Step 2: Build lookup maps from current students (deduplicated by registration number)
-    const baseStudents = deduplicateStudentsByRegistration(students);
+    // Step 2: Build lookup maps from current students (using latestStudentsRef so sequential calls never use stale state)
+    const baseStudents = deduplicateStudentsByRegistration(
+      latestStudentsRef.current && latestStudentsRef.current.length > 0 ? latestStudentsRef.current : students
+    );
     const studentMap = new Map<string, StudentProfile>();
     const exactRegMap = new Map<string, StudentProfile>();
     const normRegMap = new Map<string, StudentProfile>();
@@ -4011,37 +4018,44 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
 
     markLocalMutation();
+    latestStudentsRef.current = uniqueUpdatedStudents;
     setStudents(uniqueUpdatedStudents);
-    try { localStorage.setItem('stanbax_students', JSON.stringify(uniqueUpdatedStudents)); } catch {}
+
+    // Ensure results publication flags are enabled in database so students have immediate access
+    const publishedConfig: AssessmentControlConfig = {
+      ...assessmentConfig,
+      midTermResultsPublished: true,
+      endTermResultsPublished: true,
+      resultsDispatchedToDashboard: true,
+      dispatchedReportKind: isTestsOnly ? 'mid' : 'end',
+      resultsDispatchedAt: timestamp,
+    };
+    setAssessmentConfig(publishedConfig);
+
+    try {
+      localStorage.setItem('stanbax_students', JSON.stringify(uniqueUpdatedStudents));
+      localStorage.setItem('stanbax_assessment_config', JSON.stringify(publishedConfig));
+    } catch {}
     broadcastLocalStateChange('stanbax_students', uniqueUpdatedStudents);
+    broadcastLocalStateChange('stanbax_assessment_config', publishedConfig);
     void syncStateOnline('stanbax_students', uniqueUpdatedStudents);
+    void syncStateOnline('stanbax_assessment_config', publishedConfig);
 
-    // Immediately force-sync updated students & results to Supabase (direct + public mirror) so they never disappear!
-    void forceSyncCollatedResultsToDatabase({
-      students: uniqueUpdatedStudents,
-      assessmentConfig,
-      subjects,
-      deletedAccountIds: Array.from(deletedAccountIdsRef.current),
-      gradingSystem,
-      officialSignatures,
-      adminPassword,
-    }).catch(err => console.warn('[Batch Upsert Supabase Sync]', err));
-
+    // Await server + Supabase database persistence so results are immediately in the database (not just localStorage)
     if (shouldReplaceEntireRoster && uniqueUpdatedStudents.length > 0) {
-      void fetch('/api/students/replace-all', {
+      await fetch('/api/students/replace-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           students: uniqueUpdatedStudents,
           subjects,
-          assessmentConfig,
+          assessmentConfig: publishedConfig,
           parents,
           deletedAccountIds: Array.from(deletedAccountIdsRef.current),
         }),
       }).catch(err => console.warn('[Batch Upsert Replace All Server Sync]', err));
     } else {
-      // Call server batch-upsert endpoint with canonical IDs so no duplicate IDs are created
-      void fetch('/api/results/batch-upsert', {
+      await fetch('/api/results/batch-upsert', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -4054,12 +4068,35 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }).catch(err => console.warn('[Batch Upsert Server Sync]', err));
     }
 
+    await fetch('/api/results/dispatch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        students: uniqueUpdatedStudents,
+        subjects,
+        assessmentConfig: publishedConfig,
+        replaceRoster: shouldReplaceEntireRoster,
+      }),
+    }).catch(() => {});
+
+    // Force-sync updated students, subjects & published config to Supabase (direct + public mirror)
+    await forceSyncCollatedResultsToDatabase({
+      students: uniqueUpdatedStudents,
+      assessmentConfig: publishedConfig,
+      subjects,
+      parents,
+      deletedAccountIds: Array.from(deletedAccountIdsRef.current),
+      gradingSystem,
+      officialSignatures,
+      adminPassword,
+    }).catch(err => console.warn('[Batch Upsert Supabase Sync]', err));
+
     return {
       success: true,
       totalProcessed: deduplicatedRecords.length,
       updatedCount,
       provisionedCount,
-      message: `Batch upsert complete: ${updatedCount} existing scholars updated, ${provisionedCount} new scholar accounts provisioned${shouldReplaceEntireRoster ? ` (Roster locked to ${uniqueUpdatedStudents.length} scholars)` : ''}.`,
+      message: `Batch import saved to database: ${updatedCount} existing scholars updated, ${provisionedCount} new scholar accounts provisioned${shouldReplaceEntireRoster ? ` (Roster locked to ${uniqueUpdatedStudents.length} scholars)` : ''}.`,
       auditLogs
     };
   };
@@ -4294,7 +4331,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     });
   };
 
-  const dispatchCollatedResultsToDashboards = async (options?: {
+  const dispatchCollatedResultsToDashboards = async (rawOptions?: string | {
     reportKind?: 'mid' | 'end';
     customMessage?: string;
     broadcastMessage?: string;
@@ -4310,8 +4347,12 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     dispatchedAt: string;
     message: string;
   }> => {
+    markLocalMutation();
+    const options = typeof rawOptions === 'string'
+      ? { targetClass: rawOptions === 'all' ? 'ALL' : rawOptions }
+      : (rawOptions || {});
     const reportKind = options?.reportKind || 'end';
-    const lockCollation = options?.lockCollation !== false;
+    const lockCollation = options?.lockCollation === true;
     const nowIso = new Date().toISOString();
     const nowReadable = new Date().toLocaleDateString('en-US', {
       month: 'short',
@@ -4326,6 +4367,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     const broadcastMsg =
       options?.customMessage?.trim() ||
+      options?.broadcastMessage?.trim() ||
       (reportKind === 'end'
         ? `Official ${activeTerm} (${activeSession}) Terminal Examination Results have been collated, approved, and sent to your dashboard.`
         : `Official ${activeTerm} (${activeSession}) Mid-Term Continuous Assessment Results have been collated and sent to your dashboard.`);
@@ -4339,8 +4381,13 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       return `${r}th`;
     };
 
+    // Always read from latestStudentsRef so publishing right after a bulk import uses the newly imported scores!
+    const sourceStudents = deduplicateStudentsByRegistration(
+      latestStudentsRef.current && latestStudentsRef.current.length > 0 ? latestStudentsRef.current : students
+    );
+
     // Step 1: Recalculate each active student's grades, termAverage, and annualAverage
-    const precomputedStudents = students.map(s => {
+    const precomputedStudents = sourceStudents.map(s => {
       if (s.isAlumni) return s;
       const rawGrades = s.grades && s.grades.length > 0 ? s.grades : [];
       const verifiedGrades: GradeRecord[] = rawGrades.map(g => {
@@ -4433,6 +4480,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (
         options?.targetClass &&
         options.targetClass !== 'ALL' &&
+        options.targetClass.toLowerCase() !== 'all' &&
         cleanStudent.grade?.toLowerCase() !== options.targetClass.toLowerCase() &&
         cleanStudent.classId !== options.targetClass
       ) {
@@ -4469,6 +4517,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
       return {
         ...(cleanStudent as StudentProfile),
+        updatedAt: nowIso,
         overallPosition: rankInfo.rankText,
         teacherRemark: finalTeacherRemark,
         principalRemark: finalPrincipalRemark,
@@ -4479,7 +4528,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           term: activeTerm,
           reportKind,
           dispatchedAt: nowIso,
-          dispatchedBy: schoolInfo.principalName || 'Office of the Principal & Registrar',
+          dispatchedBy: options?.dispatchedBy || schoolInfo.principalName || 'Office of the Principal & Registrar',
           broadcastMessage: broadcastMsg,
           termAverage: effectiveAvg,
           annualAverage: cleanStudent.cumulativeAnnualAverage ?? effectiveAvg,
@@ -4500,22 +4549,23 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     const updatedConfig: AssessmentControlConfig = {
       ...assessmentConfig,
       activePhase: lockCollation ? 'closed' : assessmentConfig.activePhase,
-      midTermResultsPublished: reportKind === 'mid' ? true : Boolean(assessmentConfig.midTermResultsPublished || true),
+      midTermResultsPublished: true,
       midTermPublishedAt:
         reportKind === 'mid' ? nowReadable : assessmentConfig.midTermPublishedAt || nowReadable,
-      endTermResultsPublished: reportKind === 'end' ? true : Boolean(assessmentConfig.endTermResultsPublished),
+      endTermResultsPublished: true,
       endTermPublishedAt:
-        reportKind === 'end' ? nowReadable : assessmentConfig.endTermPublishedAt,
+        reportKind === 'end' ? nowReadable : assessmentConfig.endTermPublishedAt || nowReadable,
       resultsDispatchedToDashboard: true,
       dispatchedReportKind: reportKind,
       resultsDispatchedAt: nowIso,
-      resultsDispatchedBy: schoolInfo.principalName || 'School Administrator',
+      resultsDispatchedBy: options?.dispatchedBy || schoolInfo.principalName || 'School Administrator',
       resultsDispatchedSession: activeSession,
       resultsDispatchedTerm: activeTerm,
       resultsDispatchMessage: broadcastMsg,
     };
 
-    // Update React states immediately
+    // Update refs & React states immediately
+    latestStudentsRef.current = updatedStudents;
     setStudents(updatedStudents);
     setAssessmentConfig(updatedConfig);
 
@@ -4545,7 +4595,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           students: updatedStudents,
           subjects,
           assessmentConfig: updatedConfig,
-          replaceRoster: !options?.targetClass || options.targetClass === 'ALL',
+          replaceRoster: !options?.targetClass || options.targetClass === 'ALL' || options.targetClass.toLowerCase() === 'all',
         }),
       });
     } catch {}
@@ -4562,6 +4612,10 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       adminPassword,
     });
 
+    const targetLabel = options?.targetClass && options.targetClass !== 'ALL' && options.targetClass.toLowerCase() !== 'all'
+      ? `${options.targetClass} (${dispatchedCount} scholars)`
+      : `All Classes (${dispatchedCount} scholars)`;
+
     return {
       ok: true,
       studentsCount: dispatchedCount,
@@ -4569,7 +4623,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       dispatchedCount: dispatchedCount,
       syncedToSupabase: dbSync.syncedToSupabase,
       dispatchedAt: nowReadable,
-      message: `Collated ${reportKind === 'end' ? 'End-of-Term' : 'Mid-Term'} results successfully sent to ${dispatchedCount} Scholar Dashboards and ${parents.length} Parent Dashboards! (${dbSync.message})`,
+      message: `Published live to database for ${targetLabel}! Students now have immediate portal access across all devices. (${dbSync.message})`,
     };
   };
 
@@ -4582,7 +4636,8 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     try {
       markLocalMutation();
       const nowIso = new Date().toISOString();
-      const currentStudents = deduplicateStudentsByRegistration(students).map(s => ({
+      const baseList = latestStudentsRef.current && latestStudentsRef.current.length > 0 ? latestStudentsRef.current : students;
+      const currentStudents = deduplicateStudentsByRegistration(baseList).map(s => ({
         ...s,
         updatedAt: nowIso,
         lastCollatedResult: s.lastCollatedResult

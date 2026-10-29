@@ -93,7 +93,8 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
     waecRegistrations,
     waecPromptBroadcast,
     dismissWaecPromptForStudent,
-    customResults
+    customResults,
+    syncOnlineStudentsNow
   } = useSchool();
 
   const isSeniorSecondaryWaec = /SSS?\s*[23]/i.test(student.grade || '');
@@ -210,6 +211,11 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
       setReportCardKind(student.lastCollatedResult.reportKind);
     }
   }, [assessmentConfig.dispatchedReportKind, student?.lastCollatedResult?.reportKind]);
+
+  // Always pull the latest published class results directly from the database (Supabase + server) when student accesses their portal or report card
+  useEffect(() => {
+    void syncOnlineStudentsNow();
+  }, [student?.id, activeTab]);
 
   const [viewMode, setViewMode] = useState<'term_sheet' | 'session_progression' | 'bece_result' | 'ncee_result' | 'external_results'>('term_sheet');
   const [modalExamResult, setModalExamResult] = useState<CustomResult | null>(null);
@@ -388,9 +394,22 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
     ? historicalSession.promotionStatus
     : (student.promotionStatus || (displayIsPass ? 'Promoted' : 'Repeat'));
 
-  // Publication gate — applies only to the live session; archives always show.
-  const midPublished = !!assessmentConfig.midTermResultsPublished;
-  const endPublished = !!assessmentConfig.endTermResultsPublished;
+  // Publication gate — unlocks immediately when results are published to the database globally OR for this student's class!
+  const hasStudentDatabaseResult = Boolean(
+    student?.lastCollatedResult?.dispatchedAt ||
+    (Array.isArray(student?.lastCollatedResult?.grades) && student.lastCollatedResult.grades.length > 0) ||
+    (Array.isArray(activeSourceGrades) && activeSourceGrades.some(g => (Number(g.ca1 || 0) + Number(g.ca2 || 0) + Number(g.ca3 || 0) + Number(g.exam || 0)) > 0))
+  );
+  const midPublished = Boolean(
+    assessmentConfig.midTermResultsPublished ||
+    assessmentConfig.resultsDispatchedToDashboard ||
+    hasStudentDatabaseResult
+  );
+  const endPublished = Boolean(
+    assessmentConfig.endTermResultsPublished ||
+    assessmentConfig.resultsDispatchedToDashboard ||
+    hasStudentDatabaseResult
+  );
   const isMidSheet = isCurrentSession && reportCardKind === 'mid';
   const kindPublished = !isCurrentSession || (isMidSheet ? midPublished : endPublished);
 

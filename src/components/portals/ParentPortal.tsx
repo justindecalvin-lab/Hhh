@@ -64,7 +64,8 @@ export const ParentPortal: React.FC<ParentPortalProps> = ({ onBackToWebsite }) =
     isCgpaActiveForClass,
     houseStandings,
     updateStudentPassport,
-    resolveReportSheetSignatures
+    resolveReportSheetSignatures,
+    syncOnlineStudentsNow
   } = useSchool();
 
   // If not authenticated, render login
@@ -181,10 +182,26 @@ export const ParentPortal: React.FC<ParentPortalProps> = ({ onBackToWebsite }) =
     selectedChild?.lastCollatedResult?.reportKind
   ]);
 
-  const midPublished = assessmentConfig.midTermResultsPublished === true ||
-    (assessmentConfig.resultsDispatchedToDashboard && assessmentConfig.dispatchedReportKind === 'mid');
-  const endPublished = assessmentConfig.endTermResultsPublished === true ||
-    (assessmentConfig.resultsDispatchedToDashboard && assessmentConfig.dispatchedReportKind === 'end');
+  React.useEffect(() => {
+    void syncOnlineStudentsNow();
+  }, [selectedChild?.id, activeTab]);
+
+  const hasChildDatabaseResult = Boolean(
+    selectedChild?.lastCollatedResult?.dispatchedAt ||
+    (Array.isArray(selectedChild?.lastCollatedResult?.grades) && selectedChild.lastCollatedResult.grades.length > 0) ||
+    (Array.isArray(selectedChild?.grades) && selectedChild.grades.some(g => (Number(g.ca1 || 0) + Number(g.ca2 || 0) + Number(g.ca3 || 0) + Number(g.exam || 0)) > 0))
+  );
+
+  const midPublished = Boolean(
+    assessmentConfig.midTermResultsPublished === true ||
+    assessmentConfig.resultsDispatchedToDashboard ||
+    hasChildDatabaseResult
+  );
+  const endPublished = Boolean(
+    assessmentConfig.endTermResultsPublished === true ||
+    assessmentConfig.resultsDispatchedToDashboard ||
+    hasChildDatabaseResult
+  );
   const isMidSheet = reportCardKind === 'mid';
   const kindPublished = isMidSheet ? midPublished : endPublished;
 

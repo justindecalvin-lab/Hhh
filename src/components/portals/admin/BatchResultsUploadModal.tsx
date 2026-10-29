@@ -1194,11 +1194,65 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
   const existingCount = previewRows.filter(r => r.isExisting).length;
   const newCount = previewRows.filter(r => !r.isExisting).length;
 
+  const importedClasses = useMemo(() => {
+    const set = new Set<string>();
+    previewRows.forEach(r => {
+      if (r.gradeLevel && r.gradeLevel.trim()) {
+        set.add(r.gradeLevel.trim());
+      }
+    });
+    return Array.from(set);
+  }, [previewRows]);
+
+  const [lastImportedClasses, setLastImportedClasses] = useState<string[]>([]);
+  const [selectedPublishClass, setSelectedPublishClass] = useState<string>('ALL');
+  const [isPublishingToClass, setIsPublishingToClass] = useState(false);
+  const [classPublishConfirmation, setClassPublishConfirmation] = useState<{
+    targetClass: string;
+    dispatchedCount: number;
+    timestamp: string;
+  } | null>(null);
+
+  const handlePublishToClassImmediately = async (targetClassOverride?: string) => {
+    if (isPublishingToClass) return;
+    setIsPublishingToClass(true);
+    setUploadErrorBanner(null);
+    try {
+      const targetCls =
+        targetClassOverride ||
+        (selectedPublishClass !== 'ALL'
+          ? selectedPublishClass
+          : lastImportedClasses.length === 1
+          ? lastImportedClasses[0]
+          : importedClasses.length === 1
+          ? importedClasses[0]
+          : 'all');
+
+      const dispatchRes = await dispatchCollatedResultsToDashboards({
+        targetClass: targetCls,
+        reportKind: uploadAssessmentScope === 'tests_only' ? 'mid' : 'end',
+        dispatchedBy: 'Admin Bulk Import & Immediate Class Publisher',
+      });
+      await unifyLocalStorageResultsToDatabase();
+
+      setClassPublishConfirmation({
+        targetClass: targetCls === 'all' || targetCls === 'ALL' ? 'All Imported Classes' : targetCls,
+        dispatchedCount: dispatchRes.dispatchedCount,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+    } catch (err: any) {
+      setUploadErrorBanner(`Class publish failed: ${err?.message || 'Unexpected database error'}`);
+    } finally {
+      setIsPublishingToClass(false);
+    }
+  };
+
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setFileName(file.name);
     setUploadErrorBanner(null);
+    setClassPublishConfirmation(null);
     const reader = new FileReader();
     reader.onload = event => {
       const content = event.target?.result as string;
@@ -1211,8 +1265,14 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
     if (rawRecords.length === 0 || isProcessing) return;
     setIsProcessing(true);
     setUploadErrorBanner(null);
+    setClassPublishConfirmation(null);
 
     try {
+      const classesInBatch = [...importedClasses];
+      setLastImportedClasses(classesInBatch);
+      const defaultTargetClass = classesInBatch.length === 1 ? classesInBatch[0] : 'ALL';
+      setSelectedPublishClass(defaultTargetClass);
+
       // Ensure any custom subject columns in the uploaded CSV are also added to websiteSubjects so they remain intact
       const uploadedSubNames = new Set<string>();
       rawRecords.forEach(r => {
@@ -1252,13 +1312,23 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
       );
 
       if (autoPublishToPortals) {
+        const targetCls = classesInBatch.length === 1 ? classesInBatch[0] : 'all';
+        const dispatchRes = await dispatchCollatedResultsToDashboards({
+          targetClass: targetCls,
+          reportKind: uploadAssessmentScope === 'tests_only' ? 'mid' : 'end',
+          dispatchedBy: 'Admin Bulk Import & Immediate Class Publisher',
+        });
         await unifyLocalStorageResultsToDatabase();
-        await dispatchCollatedResultsToDashboards('all');
+        setClassPublishConfirmation({
+          targetClass: targetCls === 'all' ? (classesInBatch.join(', ') || 'All Imported Classes') : targetCls,
+          dispatchedCount: dispatchRes.dispatchedCount,
+          timestamp: new Date().toLocaleTimeString(),
+        });
       }
 
       setAuditResult({
         ...result,
-        message: `${result.message}${autoPublishToPortals ? ' Published live to Student & Parent Portals across all devices!' : ''}`
+        message: `${result.message}${autoPublishToPortals ? ' Published live to the central database — students have immediate portal access!' : ''}`
       });
     } catch (err: any) {
       setUploadErrorBanner(`Batch upload failed: ${err?.message || 'Unexpected error'}`);
@@ -2195,7 +2265,7 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
                   {/* Execution Bar */}
                   <div className="pt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-t border-slate-100">
                     <div className="text-xs text-slate-600">
-                      Target Term: <strong>{selectedTerm}</strong> • Session: <strong>{selectedSession}</strong> • Scope: <strong>{uploadAssessmentScope === 'tests_only' ? '1st & 2nd Tests Only' : 'Full Composite'}</strong>
+                      Target Term: <strong>{selectedTerm}</strong> • Session: <strong>{selectedSession}</strong> • Classes in File: <strong>{importedClasses.length > 0 ? importedClasses.join(', ') : defaultGradeFallback}</strong> • Scope: <strong>{uploadAssessmentScope === 'tests_only' ? '1st & 2nd Tests Only' : 'Full Composite'}</strong>
                     </div>
 
                     <button
@@ -2205,7 +2275,13 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
                       className="px-6 py-3 rounded-2xl bg-gradient-to-r from-blue-900 via-indigo-900 to-blue-950 hover:from-blue-950 hover:to-indigo-950 text-white font-black text-xs transition shadow-lg flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 active:scale-98"
                     >
                       <Zap className="w-4 h-4 text-amber-400" />
-                      <span>{isProcessing ? 'Processing Upsert & Provisioning...' : `Execute Batch Upsert (${previewRows.length} Scholars)`}</span>
+                      <span>
+                        {isProcessing
+                          ? 'Saving to Database & Publishing...'
+                          : autoPublishToPortals
+                          ? `Step 1 & 2: Bulk Import + Publish to ${importedClasses.length === 1 ? importedClasses[0] : 'Class'} Immediately (${previewRows.length} Scholars)`
+                          : `Step 1: Execute Bulk Result Import (${previewRows.length} Scholars)`}
+                      </span>
                     </button>
                   </div>
                 </div>
@@ -2225,7 +2301,7 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
                     <CheckCircle2 className="w-6 h-6 text-emerald-600" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-black text-slate-900">Batch Upsert &amp; Account Provisioning Complete</h3>
+                    <h3 className="text-lg font-black text-slate-900">Step 1 Complete: Bulk Result Import Saved to Database</h3>
                     <p className="text-xs text-slate-500">{auditResult.message}</p>
                   </div>
                 </div>
@@ -2243,6 +2319,67 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
                     <span className="block text-2xl font-black text-purple-800">{auditResult.provisionedCount}</span>
                     <span className="text-xs font-bold text-purple-700">New Accounts Provisioned</span>
                   </div>
+                </div>
+
+                {/* STEP 2 & STEP 3: PUBLISH TO CLASS IMMEDIATELY (CENTRAL DATABASE) */}
+                <div className="p-5 rounded-2xl bg-gradient-to-r from-emerald-950 via-teal-950 to-slate-900 text-white border border-emerald-700/50 space-y-4 shadow-md">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div className="space-y-1">
+                      <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 text-[10px] font-black uppercase tracking-wider">
+                        <Database className="w-3 h-3" /> Step 2 &amp; Step 3 • Central Database Live Dispatch
+                      </div>
+                      <h4 className="text-sm font-black text-white">
+                        Publish Results to Class Immediately (Students Have Instant Portal Access)
+                      </h4>
+                      <p className="text-xs text-emerald-100/80">
+                        Pushes collated report cards, class rankings, and scores directly to the Supabase &amp; Server database (not local storage) so students in the class can log in on any phone or computer and view their results immediately.
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {lastImportedClasses.length > 1 && (
+                        <select
+                          value={selectedPublishClass}
+                          onChange={e => setSelectedPublishClass(e.target.value)}
+                          className="px-3 py-2.5 rounded-xl bg-white/10 border border-white/20 text-white text-xs font-bold focus:outline-none"
+                        >
+                          <option value="ALL" className="text-slate-900">All Imported Classes ({lastImportedClasses.length})</option>
+                          {lastImportedClasses.map(cls => (
+                            <option key={cls} value={cls} className="text-slate-900">{cls}</option>
+                          ))}
+                        </select>
+                      )}
+                      <button
+                        type="button"
+                        disabled={isPublishingToClass}
+                        onClick={() => handlePublishToClassImmediately()}
+                        className="px-5 py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-xs transition shadow-lg flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                      >
+                        <Zap className="w-4 h-4 fill-slate-950" />
+                        <span>
+                          {isPublishingToClass
+                            ? 'Publishing to Database...'
+                            : classPublishConfirmation
+                            ? `Re-Publish to ${lastImportedClasses.length === 1 ? lastImportedClasses[0] : 'Class'} Portals Now`
+                            : `Publish Results to ${lastImportedClasses.length === 1 ? lastImportedClasses[0] : 'Class'} Immediately`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {classPublishConfirmation && (
+                    <div className="p-3.5 rounded-xl bg-emerald-500/15 border border-emerald-400/30 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-emerald-200">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span>
+                          <strong>LIVE IN DATABASE ({classPublishConfirmation.timestamp}):</strong> Published to <strong>{classPublishConfirmation.targetClass}</strong> ({classPublishConfirmation.dispatchedCount} scholar portals updated). Students now have immediate access on all devices!
+                        </span>
+                      </div>
+                      <span className="px-2.5 py-1 rounded-lg bg-emerald-400/20 text-emerald-300 font-black text-[10px] uppercase tracking-wider shrink-0">
+                        Step 3 Active: Student Access Unlocked
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 {auditResult.provisionedCount > 0 && (
