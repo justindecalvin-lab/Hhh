@@ -15,8 +15,12 @@ import {
   broadcastLocalStateChange,
   fetchLiveSupabaseChatAndDirectoryState,
   forceSyncCollatedResultsToDatabase,
+  pushAllDataToSupabase,
   deduplicateStudentsByRegistration,
   normalizeRegForUpsert,
+  lastLocalMutationAt,
+  markLocalMutation,
+  hasPendingRemoteWrites,
 } from '../lib/supabase';
 import { 
   AppImages, 
@@ -394,6 +398,7 @@ interface SchoolContextType {
     targetSession?: string,
     options?: {
       assessmentMode?: 'tests_only' | 'full';
+      replaceEntireRoster?: boolean;
     }
   ) => Promise<{
     success: boolean;
@@ -2162,6 +2167,11 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       } catch {}
       broadcastLocalStateChange('stanbax_subjects', updated);
       void syncStateOnline('stanbax_subjects', updated);
+      void fetch('/api/subjects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subjects: updated }),
+      }).catch(() => {});
       return updated;
     });
   };
@@ -2174,6 +2184,11 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       } catch {}
       broadcastLocalStateChange('stanbax_subjects', updated);
       void syncStateOnline('stanbax_subjects', updated);
+      void fetch('/api/subjects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subjects: updated }),
+      }).catch(() => {});
       return updated;
     });
   };
@@ -2186,6 +2201,11 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       } catch {}
       broadcastLocalStateChange('stanbax_subjects', updated);
       void syncStateOnline('stanbax_subjects', updated);
+      void fetch('/api/subjects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subjects: updated }),
+      }).catch(() => {});
       return updated;
     });
   };
@@ -2198,6 +2218,11 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     } catch {}
     broadcastLocalStateChange('stanbax_subjects', defaults);
     void syncStateOnline('stanbax_subjects', defaults);
+    void fetch('/api/subjects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subjects: defaults }),
+    }).catch(() => {});
   };
 
   // 6. Grading System
@@ -2910,6 +2935,9 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [onlineStudentsSynced, setOnlineStudentsSynced] = useState<boolean>(false);
 
   const syncOnlineStudentsNow = async () => {
+    if (hasPendingRemoteWrites() || Date.now() - lastLocalMutationAt < 8000) {
+      return;
+    }
     try {
       const res = await fetch('/api/students');
       if (res.ok) {
@@ -2922,8 +2950,8 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             const prevFiltered = prev.filter(
               ps => ps && ps.id && !isAccountTombstoned(ps.id, ps.regNumber, ps.email)
             );
-            // Put prevFiltered first so canonical existing student IDs are preserved, then merge online updates by registration number
-            const deduplicated = deduplicateStudentsByRegistration([...prevFiltered, ...onlineFiltered]);
+            // Put onlineFiltered first and prevFiltered second so local changes take precedence unless online record has a newer timestamp
+            const deduplicated = deduplicateStudentsByRegistration([...onlineFiltered, ...prevFiltered]);
             try { localStorage.setItem('stanbax_students', JSON.stringify(deduplicated)); } catch {}
             return deduplicated;
           });
@@ -2933,6 +2961,30 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     } catch (err) {
       console.warn('[Online Storage] Could not hydrate online students:', err);
     }
+
+    try {
+      const subRes = await fetch('/api/subjects');
+      if (subRes.ok) {
+        const subData = await subRes.json();
+        if (subData.success && Array.isArray(subData.subjects) && subData.subjects.length > 0) {
+          setSubjects(prev => {
+            const seen = new Map<string, Subject>();
+            prev.forEach(s => { if (s?.name) seen.set(s.name.trim().toLowerCase(), s); });
+            let added = false;
+            subData.subjects.forEach((s: Subject) => {
+              if (s?.name && !seen.has(s.name.trim().toLowerCase())) {
+                seen.set(s.name.trim().toLowerCase(), normalizeSubject(s));
+                added = true;
+              }
+            });
+            if (!added) return prev;
+            const merged = Array.from(seen.values());
+            try { localStorage.setItem('stanbax_subjects', JSON.stringify(merged)); } catch {}
+            return merged;
+          });
+        }
+      }
+    } catch {}
 
     try {
       const cfgRes = await fetch('/api/assessment-config');
@@ -3331,6 +3383,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
         const avg = Math.round(nextGrades.reduce((sum, g) => sum + g.total, 0) / (nextGrades.length || 1) * 10) / 10;
         const annualAvg = Math.round(nextGrades.reduce((sum, g) => sum + (g.annualAverage ?? g.total), 0) / (nextGrades.length || 1) * 10) / 10;
+        const nowIso = new Date().toISOString();
 
         return {
           ...s,
@@ -3339,9 +3392,23 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           cumulativeAnnualAverage: annualAvg,
           ...(activeTerm === '1st Term' ? { term1Average: avg } : {}),
           ...(activeTerm === '2nd Term' ? { term2Average: avg } : {}),
-          ...(activeTerm === '3rd Term' ? { term3Average: avg } : {})
-        };
+          ...(activeTerm === '3rd Term' ? { term3Average: avg } : {}),
+          updatedAt: nowIso,
+          lastCollatedResult: {
+            ...(s.lastCollatedResult || {
+              session: assessmentConfig.activeSession || '2026/2027',
+              term: activeTerm,
+              reportKind: 'end' as const,
+              dispatchedBy: 'Gradebook Entry',
+              annualAverage: annualAvg,
+            }),
+            dispatchedAt: nowIso,
+            termAverage: avg,
+            grades: nextGrades,
+          },
+        } as StudentProfile;
       });
+      markLocalMutation();
       try {
         localStorage.setItem('stanbax_students', JSON.stringify(updated));
       } catch {}
@@ -3376,6 +3443,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     scores.forEach(s => scoresMap.set(s.studentId, s));
 
     setStudents(prev => {
+      const nowIso = new Date().toISOString();
       const updated = prev.map(s => {
         const score = scoresMap.get(s.id);
         if (!score) return s;
@@ -3442,10 +3510,24 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           cumulativeAnnualAverage: annualAvg,
           ...(activeTerm === '1st Term' ? { term1Average: avg } : {}),
           ...(activeTerm === '2nd Term' ? { term2Average: avg } : {}),
-          ...(activeTerm === '3rd Term' ? { term3Average: avg } : {})
-        };
+          ...(activeTerm === '3rd Term' ? { term3Average: avg } : {}),
+          updatedAt: nowIso,
+          lastCollatedResult: {
+            ...(s.lastCollatedResult || {
+              session: assessmentConfig.activeSession || '2026/2027',
+              term: activeTerm,
+              reportKind: 'end' as const,
+              dispatchedBy: 'Bulk Class Score Entry',
+              annualAverage: annualAvg,
+            }),
+            dispatchedAt: nowIso,
+            termAverage: avg,
+            grades: nextGrades,
+          },
+        } as StudentProfile;
       });
 
+      markLocalMutation();
       try {
         localStorage.setItem('stanbax_students', JSON.stringify(updated));
       } catch {}
@@ -3499,6 +3581,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     targetSession: string = assessmentConfig.activeSession || '2026/2027',
     options?: {
       assessmentMode?: 'tests_only' | 'full';
+      replaceEntireRoster?: boolean;
     }
   ): Promise<{
     success: boolean;
@@ -3525,11 +3608,14 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       };
     }
 
+    markLocalMutation();
     let updatedCount = 0;
     let provisionedCount = 0;
     const auditLogs: Array<{ name: string; regNumber: string; status: string; subjectsCount: number; termAverage: number }> = [];
     const timestamp = new Date().toISOString();
     const isTestsOnly = options?.assessmentMode === 'tests_only';
+    const shouldReplaceEntireRoster = Boolean(options?.replaceEntireRoster);
+    const touchedStudentIds = new Set<string>();
 
     // Step 1: Deduplicate incoming records by registration number / student ID so duplicate CSV rows for the same regNo merge cleanly
     const mergedIncomingMap = new Map<string, any>();
@@ -3749,13 +3835,18 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           ? Math.round((existingGrades.reduce((sum, g) => sum + (g.total || 0), 0) / existingGrades.length) * 10) / 10
           : 0;
 
+        const updatedPassword = (rec.password && String(rec.password).trim()) ? String(rec.password).trim() : matched.password;
         const updatedStudent: StudentProfile = {
           ...matched,
           name: rawName || matched.name,
           grade: rec.grade_level || rec.grade || rec.class || matched.grade,
+          password: updatedPassword,
+          parentName: rec.parent_name || rec.parentName || matched.parentName,
+          parentPhone: rec.parent_phone || rec.parentPhone || matched.parentPhone,
           grades: existingGrades,
           termAverage: termAvg,
           cumulativeAnnualAverage: termAvg,
+          updatedAt: timestamp,
           ...(targetTerm === '1st Term' ? { term1Average: termAvg } : {}),
           ...(targetTerm === '2nd Term' ? { term2Average: termAvg } : {}),
           ...(targetTerm === '3rd Term' ? { term3Average: termAvg } : {}),
@@ -3769,8 +3860,19 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             annualAverage: termAvg,
             grades: existingGrades
           }
-        };
+        } as StudentProfile;
 
+        if (rec.password && String(rec.password).trim() && String(rec.password).trim() !== matched.password) {
+          void remoteCreateCredential(
+            matched.regNumber,
+            String(rec.password).trim(),
+            'student',
+            matched.id,
+            [updatedStudent.email, updatedStudent.name.toLowerCase()]
+          );
+        }
+
+        touchedStudentIds.add(matched.id);
         studentMap.set(matched.id, updatedStudent);
         studentMap.set(matched.id.toLowerCase(), updatedStudent);
         if (matched.regNumber) {
@@ -3794,6 +3896,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           student_id: matched.regNumber,
           regNumber: matched.regNumber,
           full_name: updatedStudent.name,
+          password: updatedPassword,
         });
       } else {
         // Provision brand new student account!
@@ -3805,6 +3908,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         const finalName = rawName || `Student ${generatedReg}`;
         const studentEmail = rawEmail || `${generatedReg.replace(/[^a-zA-Z0-9]/g, '').toLowerCase()}@stanbaxschools.edu.ng`;
         const studentGrade = rec.grade_level || rec.grade || rec.class || 'SSS 1 Science';
+        const customPass = (rec.password && String(rec.password).trim()) ? String(rec.password).trim() : 'stanbax2025';
 
         const formattedGrades: GradeRecord[] = parsedSubjects.map(sub => ({
           id: `grd-${newId}-${sub.subject.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
@@ -3836,10 +3940,11 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           parentPhone: rec.parent_phone || rec.parentPhone || '+234 800 000 0000',
           emergencyPhone: rec.parent_phone || rec.parentPhone || '+234 800 000 0000',
           email: studentEmail,
-          password: 'stanbax2025',
+          password: customPass,
           attendancePercent: 95,
           termAverage: termAvg,
           cumulativeAnnualAverage: termAvg,
+          updatedAt: timestamp,
           ...(targetTerm === '1st Term' ? { term1Average: termAvg } : {}),
           grades: formattedGrades,
           lastCollatedResult: {
@@ -3852,8 +3957,9 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             annualAverage: termAvg,
             grades: formattedGrades
           }
-        };
+        } as StudentProfile;
 
+        touchedStudentIds.add(newId);
         studentMap.set(newId, newStudent);
         studentMap.set(newId.toLowerCase(), newStudent);
         exactRegMap.set(generatedReg.toLowerCase().replace(/\s+/g, ''), newStudent);
@@ -3885,38 +3991,75 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           student_id: generatedReg,
           regNumber: generatedReg,
           full_name: finalName,
+          password: customPass,
         });
       }
     }
 
-    const uniqueUpdatedStudents = deduplicateStudentsByRegistration(
+    let uniqueUpdatedStudents = deduplicateStudentsByRegistration(
       Array.from(new Map(Array.from(studentMap.values()).map(s => [s.id, s])).values())
     );
 
+    if (shouldReplaceEntireRoster && touchedStudentIds.size > 0) {
+      // Tombstone any student not in the uploaded authoritative file so the roster matches the uploaded count (e.g. 88 students)
+      baseStudents.forEach(s => {
+        if (s && s.id && !touchedStudentIds.has(s.id)) {
+          markAccountAsPermanentlyDeleted(s.id, s.regNumber, s.email);
+        }
+      });
+      uniqueUpdatedStudents = uniqueUpdatedStudents.filter(s => touchedStudentIds.has(s.id));
+    }
+
+    markLocalMutation();
     setStudents(uniqueUpdatedStudents);
     try { localStorage.setItem('stanbax_students', JSON.stringify(uniqueUpdatedStudents)); } catch {}
     broadcastLocalStateChange('stanbax_students', uniqueUpdatedStudents);
     void syncStateOnline('stanbax_students', uniqueUpdatedStudents);
 
-    // Call server batch-upsert endpoint with canonical IDs so no duplicate IDs are created
-    void fetch('/api/results/batch-upsert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        records: serverSyncRecords,
-        targetTerm,
-        targetSession,
-        assessmentMode: options?.assessmentMode || 'full',
-        creatorName: 'Admin Batch Collation Desk'
-      })
-    }).catch(err => console.warn('[Batch Upsert Server Sync]', err));
+    // Immediately force-sync updated students & results to Supabase (direct + public mirror) so they never disappear!
+    void forceSyncCollatedResultsToDatabase({
+      students: uniqueUpdatedStudents,
+      assessmentConfig,
+      subjects,
+      deletedAccountIds: Array.from(deletedAccountIdsRef.current),
+      gradingSystem,
+      officialSignatures,
+      adminPassword,
+    }).catch(err => console.warn('[Batch Upsert Supabase Sync]', err));
+
+    if (shouldReplaceEntireRoster && uniqueUpdatedStudents.length > 0) {
+      void fetch('/api/students/replace-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          students: uniqueUpdatedStudents,
+          subjects,
+          assessmentConfig,
+          parents,
+          deletedAccountIds: Array.from(deletedAccountIdsRef.current),
+        }),
+      }).catch(err => console.warn('[Batch Upsert Replace All Server Sync]', err));
+    } else {
+      // Call server batch-upsert endpoint with canonical IDs so no duplicate IDs are created
+      void fetch('/api/results/batch-upsert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          records: serverSyncRecords,
+          targetTerm,
+          targetSession,
+          assessmentMode: options?.assessmentMode || 'full',
+          creatorName: 'Admin Batch Collation Desk'
+        })
+      }).catch(err => console.warn('[Batch Upsert Server Sync]', err));
+    }
 
     return {
       success: true,
       totalProcessed: deduplicatedRecords.length,
       updatedCount,
       provisionedCount,
-      message: `Batch upsert complete: ${updatedCount} existing scholars updated, ${provisionedCount} new scholar accounts provisioned.`,
+      message: `Batch upsert complete: ${updatedCount} existing scholars updated, ${provisionedCount} new scholar accounts provisioned${shouldReplaceEntireRoster ? ` (Roster locked to ${uniqueUpdatedStudents.length} scholars)` : ''}.`,
       auditLogs
     };
   };
@@ -4400,7 +4543,9 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           students: updatedStudents,
+          subjects,
           assessmentConfig: updatedConfig,
+          replaceRoster: !options?.targetClass || options.targetClass === 'ALL',
         }),
       });
     } catch {}
@@ -4409,6 +4554,9 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     const dbSync = await forceSyncCollatedResultsToDatabase({
       students: updatedStudents,
       assessmentConfig: updatedConfig,
+      subjects,
+      parents,
+      deletedAccountIds: Array.from(deletedAccountIdsRef.current),
       gradingSystem,
       officialSignatures,
       adminPassword,
@@ -4432,12 +4580,37 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     syncedToCloud: boolean;
   }> => {
     try {
-      const currentStudents = students;
-      const currentConfig = assessmentConfig;
+      markLocalMutation();
+      const nowIso = new Date().toISOString();
+      const currentStudents = deduplicateStudentsByRegistration(students).map(s => ({
+        ...s,
+        updatedAt: nowIso,
+        lastCollatedResult: s.lastCollatedResult
+          ? { ...s.lastCollatedResult, dispatchedAt: nowIso }
+          : {
+              session: assessmentConfig.activeSession || '2026/2027',
+              term: (assessmentConfig.activeTerm as any) || '1st Term',
+              reportKind: (assessmentConfig.dispatchedReportKind as any) || 'end',
+              dispatchedAt: nowIso,
+              dispatchedBy: activeAdminAccount?.name || 'School Administrator',
+              termAverage: s.termAverage || 0,
+              annualAverage: s.cumulativeAnnualAverage || s.termAverage || 0,
+              grades: s.grades || [],
+            },
+      }));
+      const currentConfig: AssessmentControlConfig = {
+        ...assessmentConfig,
+        resultsDispatchedToDashboard: true,
+        midTermResultsPublished: true,
+        endTermResultsPublished: true,
+        resultsDispatchedAt: nowIso,
+      };
       const currentCustomResults = customResults;
 
-      // 1. Send to Express Backend /api/results/unify
-      let serverSuccess = false;
+      setStudents(currentStudents);
+      setAssessmentConfig(currentConfig);
+
+      // 1. Send to Express Backend /api/results/unify (and replace roster so 88 stays 88)
       let serverCount = currentStudents.length;
       try {
         const res = await fetch('/api/results/unify', {
@@ -4445,14 +4618,15 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             students: currentStudents,
+            subjects,
             assessmentConfig: currentConfig,
             customResults: currentCustomResults,
+            replaceRoster: true,
             unifiedBy: activeAdminAccount?.name || 'School Administrator'
           })
         });
         if (res.ok) {
           const json = await res.json();
-          serverSuccess = json.success;
           if (json.stats?.unifiedStudentsCount) {
             serverCount = json.stats.unifiedStudentsCount;
           }
@@ -4467,6 +4641,9 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         const cloudSync = await forceSyncCollatedResultsToDatabase({
           students: currentStudents,
           assessmentConfig: currentConfig,
+          subjects,
+          parents,
+          deletedAccountIds: Array.from(deletedAccountIdsRef.current),
           gradingSystem,
           officialSignatures,
           adminPassword
@@ -4479,17 +4656,19 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       // 3. Update localStorage & broadcast to all tabs
       try {
         localStorage.setItem('stanbax_students', JSON.stringify(currentStudents));
+        localStorage.setItem('stanbax_subjects', JSON.stringify(subjects));
         localStorage.setItem('stanbax_assessment_config', JSON.stringify(currentConfig));
         localStorage.setItem('stanbax_custom_results', JSON.stringify(currentCustomResults));
       } catch {}
       broadcastLocalStateChange('stanbax_students', currentStudents);
+      broadcastLocalStateChange('stanbax_subjects', subjects);
       broadcastLocalStateChange('stanbax_assessment_config', currentConfig);
       broadcastLocalStateChange('stanbax_custom_results', currentCustomResults);
 
       return {
         ok: true,
         count: serverCount,
-        message: `Successfully unified ${serverCount} scholar results from local storage to database.${cloudSynced ? ' Synced with Supabase PostgreSQL.' : ''}`,
+        message: `Successfully unified & published ${serverCount} scholar records, logins, and ${subjects.length} subjects from local storage to the live database.${cloudSynced ? ' Synced with Supabase PostgreSQL.' : ''}`,
         syncedToCloud: cloudSynced
       };
     } catch (err: any) {
@@ -7883,9 +8062,10 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const exportDatabaseSnapshot = (): string => {
     const backup: Record<string, unknown> = {
-      version: '2.0',
+      version: '2.1',
       schoolName: 'Stanbax Schools Ibadan',
-      exportedAt: new Date().toISOString()
+      exportedAt: new Date().toISOString(),
+      deletedAccountIds: Array.from(deletedAccountIdsRef.current),
     };
     snapshotFields().forEach(f => {
       backup[f.key] = f.get();
@@ -7895,13 +8075,68 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const importDatabaseSnapshot = (jsonData: string): { success: boolean; message: string; recordCounts?: Record<string, number> } => {
     try {
+      markLocalMutation();
       const parsed = JSON.parse(jsonData);
       if (!parsed || typeof parsed !== 'object') {
         return { success: false, message: 'Invalid backup file format.' };
       }
       const counts: Record<string, number> = {};
+
+      // If students array is in the backup, tombstone any previous demo/local students not in the imported list
+      let importedStudentsClean: StudentProfile[] | undefined;
+      if (Array.isArray(parsed.students) && parsed.students.length > 0) {
+        const nowIso = new Date().toISOString();
+        importedStudentsClean = deduplicateStudentsByRegistration(
+          (parsed.students as StudentProfile[]).map(s => ({
+            ...s,
+            password: s.password || 'stanbax2025',
+            updatedAt: nowIso,
+          }))
+        );
+        const importedIds = new Set(importedStudentsClean.map(s => String(s.id || '').toLowerCase()));
+        const importedRegs = new Set(importedStudentsClean.map(s => normalizeRegForUpsert(s.regNumber)));
+
+        students.forEach(oldStu => {
+          const oldId = String(oldStu.id || '').toLowerCase();
+          const oldReg = normalizeRegForUpsert(oldStu.regNumber);
+          if (!importedIds.has(oldId) && (!oldReg || !importedRegs.has(oldReg))) {
+            markAccountAsPermanentlyDeleted(oldStu.id, oldStu.regNumber, 'student');
+          }
+        });
+
+        // Un-tombstone all imported students so none are filtered out
+        importedStudentsClean.forEach(s => {
+          const sid = String(s.id || '').toLowerCase();
+          const sreg = String(s.regNumber || '').toLowerCase();
+          deletedAccountIdsRef.current.delete(sid);
+          deletedAccountIdsRef.current.delete(sreg);
+          deletedAccountIdsRef.current.delete(sreg.replace(/\s+/g, ''));
+          // Also ensure each student login credential is active in Supabase
+          if (s.regNumber) {
+            void remoteCreateCredential(
+              s.regNumber,
+              s.password || 'stanbax2025',
+              'student',
+              s.id,
+              [s.email || '', s.name?.toLowerCase() || ''].filter(Boolean)
+            );
+          }
+        });
+      }
+
+      if (Array.isArray(parsed.deletedAccountIds)) {
+        parsed.deletedAccountIds.forEach((id: string) => {
+          if (id) deletedAccountIdsRef.current.add(String(id).toLowerCase());
+        });
+      }
+
       snapshotFields().forEach(f => {
-        const value = (parsed as Record<string, unknown>)[f.key];
+        let value = (parsed as Record<string, unknown>)[f.key];
+        if (f.key === 'students' && importedStudentsClean) {
+          value = importedStudentsClean;
+        } else if (f.key === 'subjects' && Array.isArray(value)) {
+          value = (value as Subject[]).map(normalizeSubject);
+        }
         if (value === undefined || value === null) return;
         if (f.isArray && !Array.isArray(value)) return;
         f.set(value);
@@ -7911,8 +8146,13 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         counts[f.label] = Array.isArray(value) ? value.length : 1;
       });
 
-      // Legacy backups (v1.0) carried one shared `grades` list — assign it to
-      // the scholar account it belonged to if they have no gradebook yet.
+      const updatedDeletedArr = Array.from(deletedAccountIdsRef.current);
+      setDeletedAccountIds(updatedDeletedArr);
+      try {
+        localStorage.setItem('stanbax_deleted_account_ids', JSON.stringify(updatedDeletedArr));
+      } catch {}
+
+      // Legacy backups (v1.0) carried one shared `grades` list
       if (Array.isArray(parsed.grades)) {
         const ownerId = sessionStorage.getItem('stanbax_student_id') || 'stu-1';
         setStudents(prev => {
@@ -7927,9 +8167,39 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         counts['Grade Records (legacy)'] = parsed.grades.length;
       }
 
+      // Immediately push imported students, subjects, and config to Express Server and Supabase Cloud
+      const finalStudentsToSync = importedStudentsClean || students;
+      const finalSubjectsToSync = Array.isArray(parsed.subjects) ? (parsed.subjects as Subject[]).map(normalizeSubject) : subjects;
+      const finalConfigToSync = (parsed.assessmentConfig as AssessmentControlConfig) || assessmentConfig;
+
+      void fetch('/api/students/replace-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          students: finalStudentsToSync,
+          subjects: finalSubjectsToSync,
+          assessmentConfig: finalConfigToSync,
+          parents: Array.isArray(parsed.parents) ? parsed.parents : parents,
+          deletedAccountIds: updatedDeletedArr,
+        }),
+      }).catch(() => {});
+
+      void forceSyncCollatedResultsToDatabase({
+        students: finalStudentsToSync,
+        assessmentConfig: finalConfigToSync,
+        subjects: finalSubjectsToSync,
+        parents: Array.isArray(parsed.parents) ? parsed.parents : parents,
+        deletedAccountIds: updatedDeletedArr,
+        gradingSystem: Array.isArray(parsed.gradingSystem) ? parsed.gradingSystem : gradingSystem,
+        officialSignatures,
+        adminPassword,
+      });
+
+      void pushAllDataToSupabase(parsed as Record<string, unknown>);
+
       return {
         success: true,
-        message: 'School database successfully restored! All records synchronized across portals with zero database issues.',
+        message: `School migration package restored! ${finalStudentsToSync.length} scholars (with logins & passwords) and ${finalSubjectsToSync.length} subjects synchronized live to server & Supabase.`,
         recordCounts: counts
       };
     } catch (err: any) {
@@ -10755,60 +11025,74 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         })
         .catch(() => {});
 
-      // Poll latest central results from database
-      fetch('/api/results/latest')
-        .then(r => (r.ok ? r.json() : null))
-        .then(data => {
-          if (data && Array.isArray(data.students) && data.students.length > 0) {
-            setStudents(prev => {
-              const map = new Map<string, StudentProfile>();
-              for (const s of prev) {
-                if (!isAccountTombstoned(s.id, s.regNumber, s.email)) {
-                  map.set(s.id, s);
-                }
-              }
-              let changed = false;
-              for (const s of data.students) {
-                if (!s?.id || isAccountTombstoned(s.id, s.regNumber, s.email)) continue;
-                const existing = map.get(s.id);
-                if (!existing) {
-                  map.set(s.id, s);
-                  changed = true;
-                } else {
-                  const remTime = s.lastCollatedResult?.dispatchedAt ? new Date(s.lastCollatedResult.dispatchedAt).getTime() : 0;
-                  const locTime = existing.lastCollatedResult?.dispatchedAt ? new Date(existing.lastCollatedResult.dispatchedAt).getTime() : 0;
-                  if (remTime > locTime) {
-                    map.set(s.id, { ...existing, ...s });
-                    changed = true;
-                  } else if ((s.grades?.length || 0) > 0 && (!existing.grades || existing.grades.length === 0)) {
-                    map.set(s.id, { ...existing, grades: s.grades, termAverage: s.termAverage || existing.termAverage });
-                    changed = true;
+      // Poll latest central results from database (skip if local mutation happened in the last 8s or writes are pending)
+      if (!hasPendingRemoteWrites() && Date.now() - lastLocalMutationAt >= 8000) {
+        fetch('/api/results/latest')
+          .then(r => (r.ok ? r.json() : null))
+          .then(data => {
+            if (!data || hasPendingRemoteWrites() || Date.now() - lastLocalMutationAt < 8000) return;
+
+            if (Array.isArray(data.deletedAccountIds) && data.deletedAccountIds.length > 0) {
+              data.deletedAccountIds.forEach((id: string) => {
+                deletedAccountIdsRef.current.add(String(id).toLowerCase());
+                deletedAccountIdsRef.current.add(String(id).toLowerCase().replace(/\s+/g, ''));
+              });
+            }
+
+            if (Array.isArray(data.subjects) && data.subjects.length > 0) {
+              setSubjects(prev => {
+                const seen = new Map<string, Subject>();
+                prev.forEach(s => { if (s?.name) seen.set(s.name.trim().toLowerCase(), s); });
+                let added = false;
+                data.subjects.forEach((s: Subject) => {
+                  if (s?.name && !seen.has(s.name.trim().toLowerCase())) {
+                    seen.set(s.name.trim().toLowerCase(), normalizeSubject(s));
+                    added = true;
                   }
-                }
-              }
-              if (!changed && map.size === prev.length) return prev;
-              const combined = Array.from(map.values());
-              try { localStorage.setItem('stanbax_students', JSON.stringify(combined)); } catch {}
-              return combined;
-            });
-          }
-          if (data?.assessmentConfig && typeof data.assessmentConfig === 'object') {
-            setAssessmentConfig(prev => {
-              const remoteCfg = data.assessmentConfig;
-              const isDiff =
-                remoteCfg.resultsDispatchedToDashboard !== prev.resultsDispatchedToDashboard ||
-                remoteCfg.dispatchedReportKind !== prev.dispatchedReportKind ||
-                remoteCfg.resultsDispatchedAt !== prev.resultsDispatchedAt ||
-                remoteCfg.midTermResultsPublished !== prev.midTermResultsPublished ||
-                remoteCfg.endTermResultsPublished !== prev.endTermResultsPublished;
-              if (!isDiff) return prev;
-              const updated = { ...prev, ...remoteCfg };
-              try { localStorage.setItem('stanbax_assessment_config', JSON.stringify(updated)); } catch {}
-              return updated;
-            });
-          }
-        })
-        .catch(() => {});
+                });
+                if (!added) return prev;
+                const merged = Array.from(seen.values());
+                try { localStorage.setItem('stanbax_subjects', JSON.stringify(merged)); } catch {}
+                return merged;
+              });
+            }
+
+            if (Array.isArray(data.students) && data.students.length > 0) {
+              setStudents(prev => {
+                const remoteValid = data.students.filter(
+                  (s: StudentProfile) => s && s.id && !isAccountTombstoned(s.id, s.regNumber, s.email)
+                );
+                const prevValid = prev.filter(
+                  s => s && s.id && !isAccountTombstoned(s.id, s.regNumber, s.email)
+                );
+                // Put remoteValid first and prevValid second so deduplicateStudentsByRegistration compares timestamps and never overwrites newer local grades
+                const deduplicated = deduplicateStudentsByRegistration([...remoteValid, ...prevValid]);
+                if (JSON.stringify(deduplicated) === JSON.stringify(prev)) return prev;
+                try { localStorage.setItem('stanbax_students', JSON.stringify(deduplicated)); } catch {}
+                return deduplicated;
+              });
+            }
+            if (data?.assessmentConfig && typeof data.assessmentConfig === 'object') {
+              setAssessmentConfig(prev => {
+                const remoteCfg = data.assessmentConfig;
+                const remTime = remoteCfg.resultsDispatchedAt ? new Date(remoteCfg.resultsDispatchedAt).getTime() : 0;
+                const locTime = prev.resultsDispatchedAt ? new Date(prev.resultsDispatchedAt).getTime() : 0;
+                if (locTime > remTime) return prev;
+                const isDiff =
+                  remoteCfg.resultsDispatchedToDashboard !== prev.resultsDispatchedToDashboard ||
+                  remoteCfg.dispatchedReportKind !== prev.dispatchedReportKind ||
+                  remoteCfg.resultsDispatchedAt !== prev.resultsDispatchedAt ||
+                  remoteCfg.midTermResultsPublished !== prev.midTermResultsPublished ||
+                  remoteCfg.endTermResultsPublished !== prev.endTermResultsPublished;
+                if (!isDiff) return prev;
+                const updated = { ...prev, ...remoteCfg };
+                try { localStorage.setItem('stanbax_assessment_config', JSON.stringify(updated)); } catch {}
+                return updated;
+              });
+            }
+          })
+          .catch(() => {});
+      }
 
       // High-concurrency heartbeat: maintain session isolation and update active users counter
       try {
@@ -10871,6 +11155,13 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (isRemoteEnabled()) {
         const liveCloud = await fetchLiveSupabaseChatAndDirectoryState();
         if (liveCloud) {
+          if (Array.isArray(liveCloud.deletedAccountIds) && liveCloud.deletedAccountIds.length > 0) {
+            liveCloud.deletedAccountIds.forEach((id: string) => {
+              deletedAccountIdsRef.current.add(String(id).toLowerCase());
+              deletedAccountIdsRef.current.add(String(id).toLowerCase().replace(/\s+/g, ''));
+            });
+          }
+
           if (Array.isArray(liveCloud.visitorConversations) && liveCloud.visitorConversations.length > 0) {
             setVisitorConversations(prev => {
               const { merged, changed } = mergeConversationLists(prev, liveCloud.visitorConversations!);
@@ -10938,98 +11229,89 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             });
           }
 
-          if (Array.isArray(liveCloud.students) && liveCloud.students.length > 0) {
-            setStudents(prev => {
-              const map = new Map<string, StudentProfile>();
-              for (const s of prev) {
-                if (!isAccountTombstoned(s.id, s.regNumber, s.email)) {
-                  map.set(s.id, s);
-                }
-              }
-              let changed = false;
-              for (const s of liveCloud.students!) {
-                if (!s?.id || isAccountTombstoned(s.id, s.regNumber, s.email)) continue;
-                const existing = map.get(s.id);
-                if (!existing) {
-                  map.set(s.id, s);
-                  changed = true;
-                } else {
-                  const remoteDisp = s.lastCollatedResult?.dispatchedAt
-                    ? new Date(s.lastCollatedResult.dispatchedAt).getTime()
-                    : 0;
-                  const localDisp = existing.lastCollatedResult?.dispatchedAt
-                    ? new Date(existing.lastCollatedResult.dispatchedAt).getTime()
-                    : 0;
-                  
-                  if (remoteDisp > localDisp) {
-                    map.set(s.id, { ...existing, ...s });
-                    changed = true;
-                  } else {
-                    // Local state has newer or equal collation state:
-                    // Preserve local grades & term averages so background poll NEVER wipes out entered results!
-                    const localGrades = existing.grades || [];
-                    const remoteGrades = s.grades || [];
-                    if (localGrades.length > 0) {
-                      const gMap = new Map<string, GradeRecord>();
-                      remoteGrades.forEach((rg: GradeRecord) => {
-                        if (rg.subject) gMap.set(rg.subject.toLowerCase(), rg);
-                      });
-                      localGrades.forEach((lg: GradeRecord) => {
-                        if (!lg.subject) return;
-                        const subKey = lg.subject.toLowerCase();
-                        const remG = gMap.get(subKey);
-                        if (!remG) {
-                          gMap.set(subKey, lg);
-                        } else {
-                          const localTotal = (lg.ca1 || 0) + (lg.ca2 || 0) + (lg.ca3 || 0) + (lg.exam || 0);
-                          const remTotal = (remG.ca1 || 0) + (remG.ca2 || 0) + (remG.ca3 || 0) + (remG.exam || 0);
-                          gMap.set(subKey, localTotal >= remTotal ? { ...remG, ...lg } : { ...lg, ...remG });
-                        }
-                      });
-                      const mergedGrades = Array.from(gMap.values());
-                      const hasDiff = JSON.stringify(mergedGrades) !== JSON.stringify(existing.grades) ||
-                        JSON.stringify(existing.lastCollatedResult) !== JSON.stringify(s.lastCollatedResult);
-                      if (hasDiff) {
-                        changed = true;
-                      }
-                      map.set(s.id, {
-                        ...s,
-                        ...existing,
-                        grades: mergedGrades,
-                        termAverage: existing.termAverage || s.termAverage,
-                        lastCollatedResult: remoteDisp > localDisp ? s.lastCollatedResult : (existing.lastCollatedResult || s.lastCollatedResult)
-                      });
-                    } else if (remoteGrades.length > 0) {
-                      map.set(s.id, { ...existing, ...s });
-                      changed = true;
-                    }
+          // Only apply cloud students/subjects/assessmentConfig if there is no recent local mutation in the last 8s
+          if (!hasPendingRemoteWrites() && Date.now() - lastLocalMutationAt >= 8000) {
+            if (Array.isArray(liveCloud.subjects) && liveCloud.subjects.length > 0) {
+              setSubjects(prev => {
+                const seen = new Map<string, Subject>();
+                prev.forEach(s => { if (s?.name) seen.set(s.name.trim().toLowerCase(), s); });
+                let added = false;
+                liveCloud.subjects!.forEach((s: Subject) => {
+                  if (s?.name && !seen.has(s.name.trim().toLowerCase())) {
+                    seen.set(s.name.trim().toLowerCase(), normalizeSubject(s));
+                    added = true;
                   }
-                }
-              }
-              if (!changed && map.size === prev.length) return prev;
-              const combined = Array.from(map.values());
-              try { localStorage.setItem('stanbax_students', JSON.stringify(combined)); } catch {}
-              return combined;
-            });
-          }
+                });
+                if (!added) return prev;
+                const merged = Array.from(seen.values());
+                try { localStorage.setItem('stanbax_subjects', JSON.stringify(merged)); } catch {}
+                return merged;
+              });
+            }
 
-          if (liveCloud.assessmentConfig && typeof liveCloud.assessmentConfig === 'object') {
-            setAssessmentConfig(prev => {
-              const remoteCfg = liveCloud.assessmentConfig;
-              const isDiff =
-                remoteCfg.resultsDispatchedToDashboard !== prev.resultsDispatchedToDashboard ||
-                remoteCfg.dispatchedReportKind !== prev.dispatchedReportKind ||
-                remoteCfg.resultsDispatchedAt !== prev.resultsDispatchedAt ||
-                remoteCfg.midTermResultsPublished !== prev.midTermResultsPublished ||
-                remoteCfg.endTermResultsPublished !== prev.endTermResultsPublished ||
-                remoteCfg.activePhase !== prev.activePhase ||
-                remoteCfg.activeTerm !== prev.activeTerm ||
-                remoteCfg.activeSession !== prev.activeSession;
-              if (!isDiff) return prev;
-              const updated = { ...prev, ...remoteCfg };
-              try { localStorage.setItem('stanbax_assessment_config', JSON.stringify(updated)); } catch {}
-              return updated;
-            });
+            if (Array.isArray(liveCloud.students) && liveCloud.students.length > 0) {
+              setStudents(prev => {
+                const remoteValid = liveCloud.students!.filter(
+                  (s: StudentProfile) => s && s.id && !isAccountTombstoned(s.id, s.regNumber, s.email)
+                );
+                // If remote has an authoritative full roster (e.g. 88 students on cloud) and local has un-synced defaults (e.g. 106),
+                // filter local prev to only keep students that either exist in remoteValid OR were locally modified more recently than remote
+                const maxRemoteTs = remoteValid.reduce((max: number, s: any) => {
+                  const t = Math.max(
+                    s?.updatedAt ? new Date(s.updatedAt).getTime() : 0,
+                    s?.lastCollatedResult?.dispatchedAt ? new Date(s.lastCollatedResult.dispatchedAt).getTime() : 0
+                  );
+                  return t > max ? t : max;
+                }, 0);
+
+                const remoteIdSet = new Set(remoteValid.map((s: any) => String(s.id || '').toLowerCase()));
+                const remoteRegSet = new Set(remoteValid.map((s: any) => normalizeRegForUpsert(s.regNumber)));
+
+                const prevFiltered = prev.filter(s => {
+                  if (!s || !s.id || isAccountTombstoned(s.id, s.regNumber, s.email)) return false;
+                  if (remoteValid.length >= 10) {
+                    const inRemote =
+                      remoteIdSet.has(String(s.id).toLowerCase()) ||
+                      (s.regNumber && remoteRegSet.has(normalizeRegForUpsert(s.regNumber)));
+                    if (inRemote) return true;
+                    const locTs = Math.max(
+                      (s as any).updatedAt ? new Date((s as any).updatedAt).getTime() : 0,
+                      s.lastCollatedResult?.dispatchedAt ? new Date(s.lastCollatedResult.dispatchedAt).getTime() : 0
+                    );
+                    // Only keep a local-only student if it was created/edited locally after the cloud snapshot
+                    return locTs > 0 && locTs >= maxRemoteTs;
+                  }
+                  return true;
+                });
+
+                const combined = deduplicateStudentsByRegistration([...remoteValid, ...prevFiltered]);
+                if (JSON.stringify(combined) === JSON.stringify(prev)) return prev;
+                try { localStorage.setItem('stanbax_students', JSON.stringify(combined)); } catch {}
+                return combined;
+              });
+            }
+
+            if (liveCloud.assessmentConfig && typeof liveCloud.assessmentConfig === 'object') {
+              setAssessmentConfig(prev => {
+                const remoteCfg = liveCloud.assessmentConfig;
+                const remTime = remoteCfg.resultsDispatchedAt ? new Date(remoteCfg.resultsDispatchedAt).getTime() : 0;
+                const locTime = prev.resultsDispatchedAt ? new Date(prev.resultsDispatchedAt).getTime() : 0;
+                if (locTime > remTime) return prev;
+                const isDiff =
+                  remoteCfg.resultsDispatchedToDashboard !== prev.resultsDispatchedToDashboard ||
+                  remoteCfg.dispatchedReportKind !== prev.dispatchedReportKind ||
+                  remoteCfg.resultsDispatchedAt !== prev.resultsDispatchedAt ||
+                  remoteCfg.midTermResultsPublished !== prev.midTermResultsPublished ||
+                  remoteCfg.endTermResultsPublished !== prev.endTermResultsPublished ||
+                  remoteCfg.activePhase !== prev.activePhase ||
+                  remoteCfg.activeTerm !== prev.activeTerm ||
+                  remoteCfg.activeSession !== prev.activeSession;
+                if (!isDiff) return prev;
+                const updated = { ...prev, ...remoteCfg };
+                try { localStorage.setItem('stanbax_assessment_config', JSON.stringify(updated)); } catch {}
+                return updated;
+              });
+            }
           }
 
           if (Array.isArray(liveCloud.tutors) && liveCloud.tutors.length > 0) {

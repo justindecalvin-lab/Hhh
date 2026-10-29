@@ -20,7 +20,9 @@ import {
   Layers, 
   School as SchoolIcon,
   ShieldCheck,
-  Sparkles
+  Sparkles,
+  Upload,
+  Database
 } from '../../RealIcons';
 
 interface AdminDownloadStudentLoginsModalProps {
@@ -57,7 +59,19 @@ export const AdminDownloadStudentLoginsModal: React.FC<AdminDownloadStudentLogin
   initialGrouping = 'parent',
   initialClass = 'all'
 }) => {
-  const { students, parents, classes, schoolInfo, syncOnlineStudentsNow, onlineStudentsSynced } = useSchool();
+  const {
+    students,
+    parents,
+    classes,
+    subjects,
+    schoolInfo,
+    syncOnlineStudentsNow,
+    onlineStudentsSynced,
+    exportDatabaseSnapshot,
+    importDatabaseSnapshot,
+    unifyLocalStorageResultsToDatabase,
+    dispatchCollatedResultsToDashboards
+  } = useSchool();
 
   const [groupingMode, setGroupingMode] = useState<'parent' | 'class' | 'flat' | 'siblings_only'>(initialGrouping);
   const [selectedClass, setSelectedClass] = useState<string>(initialClass);
@@ -67,6 +81,7 @@ export const AdminDownloadStudentLoginsModal: React.FC<AdminDownloadStudentLogin
   const [copiedState, setCopiedState] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncFeedback, setSyncFeedback] = useState<string | null>(null);
+  const migrationFileInputRef = React.useRef<HTMLInputElement | null>(null);
 
   // 1. Process all student records and link them to parents & identify siblings
   const allProcessedRecords = useMemo<StudentLoginRecord[]>(() => {
@@ -283,20 +298,71 @@ export const AdminDownloadStudentLoginsModal: React.FC<AdminDownloadStudentLogin
     return filteredRecords.filter(r => r.isMultiSibling).length;
   }, [filteredRecords]);
 
-  // Server re-sync handler
+  // Server re-sync & live publish handler (pushes current edited roster, logins, subjects & results live)
   const handleTriggerSync = async () => {
     setIsSyncing(true);
     setSyncFeedback(null);
     try {
+      const unifyRes = await unifyLocalStorageResultsToDatabase();
+      await dispatchCollatedResultsToDashboards('all');
       await syncOnlineStudentsNow();
-      setSyncFeedback('Synchronized live with central server database.');
-      setTimeout(() => setSyncFeedback(null), 3500);
+      setSyncFeedback(
+        unifyRes?.message ||
+        `Published & synchronized ${students.filter(s => !s.isUpgradedTutor).length} scholars, logins, and ${subjects.length} subjects live across all devices.`
+      );
+      setTimeout(() => setSyncFeedback(null), 5000);
     } catch {
       setSyncFeedback('Unable to reach server database.');
       setTimeout(() => setSyncFeedback(null), 3500);
     } finally {
       setIsSyncing(false);
     }
+  };
+
+  // Export Complete Migration Backup (Edited Students + Logins + Subjects + Classes + Results)
+  const handleExportMigrationBackup = () => {
+    try {
+      const snapshotJson = exportDatabaseSnapshot();
+      const timestamp = new Date().toISOString().split('T')[0];
+      const blob = new Blob([snapshotJson], { type: 'application/json;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `Stanbax_Complete_Migration_${totalStudentsCount}_Scholars_Logins_Subjects_${timestamp}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      setSyncFeedback(`Downloaded full migration backup (${totalStudentsCount} scholars, logins & ${subjects.length} created subjects).`);
+      setTimeout(() => setSyncFeedback(null), 5000);
+    } catch (err: any) {
+      setSyncFeedback(`Export failed: ${err?.message || 'Unexpected error'}`);
+    }
+  };
+
+  // Import Complete Migration Backup (Restores exact edited students, logins & subjects and replaces demo roster)
+  const handleImportMigrationBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async event => {
+      try {
+        const content = event.target?.result as string;
+        const result = importDatabaseSnapshot(content);
+        if (result.success) {
+          setSyncFeedback(`${result.message} Syncing live to portals...`);
+          await unifyLocalStorageResultsToDatabase();
+          await dispatchCollatedResultsToDashboards('all');
+        } else {
+          setSyncFeedback(result.message);
+        }
+        setTimeout(() => setSyncFeedback(null), 6000);
+      } catch (err: any) {
+        setSyncFeedback(`Import failed: ${err?.message || 'Invalid migration file'}`);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
   };
 
   // Helper for CSV escaping
@@ -655,16 +721,43 @@ export const AdminDownloadStudentLoginsModal: React.FC<AdminDownloadStudentLogin
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <input
+              ref={migrationFileInputRef}
+              type="file"
+              accept=".json"
+              onChange={handleImportMigrationBackup}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={handleExportMigrationBackup}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-400 hover:bg-amber-300 text-stone-950 text-xs font-black transition shadow-xs cursor-pointer"
+              title="Download all edited students, logins, passwords, and created subjects for hosting migration"
+            >
+              <Database className="w-3.5 h-3.5" />
+              <span>Export Migration Backup ({totalStudentsCount})</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => migrationFileInputRef.current?.click()}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-bold transition border border-white/25 cursor-pointer"
+              title="Import migration backup file (.json) to restore edited students, logins, and subjects"
+            >
+              <Upload className="w-3.5 h-3.5 text-amber-300" />
+              <span>Import Migration File</span>
+            </button>
+
             <button
               type="button"
               onClick={handleTriggerSync}
               disabled={isSyncing}
-              className="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-bold transition border border-white/20 disabled:opacity-50 cursor-pointer"
-              title="Verify and pull latest logins and password updates from server database"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black transition border border-emerald-400/40 disabled:opacity-50 cursor-pointer"
+              title="Push this browser's edited students, logins, subjects, and results live to all devices & portals"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin text-amber-300' : ''}`} />
-              <span>{isSyncing ? 'Syncing...' : 'Live Sync'}</span>
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin text-amber-200' : ''}`} />
+              <span>{isSyncing ? 'Publishing Live...' : 'Push & Sync Live'}</span>
             </button>
 
             <button

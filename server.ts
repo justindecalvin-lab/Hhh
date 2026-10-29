@@ -879,6 +879,7 @@ async function startServer() {
   const THEME_FILE = path.join(DATA_DIR, "theme.json");
   const DELETED_ACCOUNTS_FILE = path.join(DATA_DIR, "deleted_accounts.json");
   const CUSTOM_RESULTS_FILE = path.join(DATA_DIR, "custom_results.json");
+  const SUBJECTS_FILE = path.join(DATA_DIR, "subjects.json");
 
   // In-Memory Caches for High-Concurrency Performance (handles 10+ simultaneous users in <1ms)
   let cachedStudents: any[] | null = null;
@@ -888,6 +889,7 @@ async function startServer() {
   let cachedAssessmentConfig: any | null = null;
   let cachedDeletedAccounts: Set<string> | null = null;
   let cachedCustomResults: any[] | null = null;
+  let cachedSubjects: any[] | null = null;
 
   // Active Concurrent User Sessions Tracker
   interface ActiveSessionInfo {
@@ -1676,10 +1678,39 @@ async function startServer() {
   function saveOnlineCustomResults(results: any[]): boolean {
     ensureDataDir();
     try {
+      cachedCustomResults = results;
       fs.writeFileSync(CUSTOM_RESULTS_FILE, JSON.stringify(results, null, 2), "utf-8");
       return true;
     } catch (e) {
       console.error("[Online Storage] Could not write custom_results.json", e);
+      return false;
+    }
+  }
+
+  function getOnlineSubjects(): any[] | null {
+    if (cachedSubjects) return cachedSubjects;
+    ensureDataDir();
+    if (fs.existsSync(SUBJECTS_FILE)) {
+      try {
+        const raw = fs.readFileSync(SUBJECTS_FILE, "utf-8");
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          cachedSubjects = parsed;
+          return parsed;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  function saveOnlineSubjects(subjectsList: any[]): boolean {
+    ensureDataDir();
+    try {
+      cachedSubjects = subjectsList;
+      fs.writeFileSync(SUBJECTS_FILE, JSON.stringify(subjectsList, null, 2), "utf-8");
+      return true;
+    } catch (e) {
+      console.error("[Online Storage] Could not write subjects.json", e);
       return false;
     }
   }
@@ -1977,14 +2008,169 @@ async function startServer() {
     }
   });
 
+  app.get("/api/subjects", (_req, res) => {
+    try {
+      const subjects = getOnlineSubjects();
+      res.json({ success: true, subjects });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message });
+    }
+  });
+
+  app.post("/api/subjects", (req, res) => {
+    try {
+      const { subjects } = req.body || {};
+      if (!Array.isArray(subjects)) {
+        return res.status(400).json({ success: false, error: "subjects array is required" });
+      }
+      saveOnlineSubjects(subjects);
+      broadcastRealtimeEvent("subjects_updated", { subjects });
+      res.json({ success: true, subjects });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message });
+    }
+  });
+
+  app.post("/api/students/replace-all", (req, res) => {
+    try {
+      const {
+        students: incomingStudents,
+        subjects: incomingSubjects,
+        assessmentConfig: incomingConfig,
+        parents: incomingParents,
+        deletedAccountIds: incomingDeletedIds,
+      } = req.body || {};
+
+      if (Array.isArray(incomingDeletedIds)) {
+        for (const delId of incomingDeletedIds) {
+          if (delId) recordDeletedAccount(String(delId), undefined, 'student');
+        }
+      }
+
+      if (Array.isArray(incomingStudents) && incomingStudents.length > 0) {
+        const existingStudents = getOnlineStudents();
+        const incomingIdSet = new Set<string>();
+        const incomingRegSet = new Set<string>();
+        for (const s of incomingStudents) {
+          if (s?.id) incomingIdSet.add(String(s.id).toLowerCase());
+          if (s?.regNumber) incomingRegSet.add(normalizeServerReg(s.regNumber));
+        }
+
+        // Tombstone any previous student not in the authoritative replacement list
+        for (const oldStu of existingStudents) {
+          const oldId = String(oldStu?.id || '').toLowerCase();
+          const oldReg = normalizeServerReg(oldStu?.regNumber);
+          const stillPresent = (oldId && incomingIdSet.has(oldId)) || (oldReg && incomingRegSet.has(oldReg));
+          if (!stillPresent && (oldStu?.id || oldStu?.regNumber)) {
+            recordDeletedAccount(oldStu.id || oldStu.regNumber, oldStu.regNumber, 'student');
+          }
+        }
+
+        // Un-tombstone all incoming students in case any were previously deleted
+        const delSet = getDeletedAccountIds();
+        let delModified = false;
+        for (const s of incomingStudents) {
+          const sid = String(s?.id || '').toLowerCase();
+          const sreg = String(s?.regNumber || '').toLowerCase();
+          const sregNoSpace = sreg.replace(/\s+/g, '');
+          const sregNorm = normalizeServerReg(s?.regNumber);
+          for (const key of [sid, sreg, sregNoSpace, sregNorm]) {
+            if (key && delSet.has(key)) {
+              delSet.delete(key);
+              delModified = true;
+            }
+          }
+        }
+        if (delModified) {
+          try {
+            fs.writeFileSync(DELETED_ACCOUNTS_FILE, JSON.stringify(Array.from(delSet), null, 2), "utf-8");
+          } catch {}
+        }
+
+        const stamped = incomingStudents.map(s => ({
+          ...s,
+          savedOnline: true,
+          updatedAt: s.updatedAt || new Date().toISOString(),
+        }));
+        saveOnlineStudents(stamped);
+      }
+
+      if (Array.isArray(incomingSubjects) && incomingSubjects.length > 0) {
+        saveOnlineSubjects(incomingSubjects);
+      }
+
+      if (incomingConfig && typeof incomingConfig === 'object') {
+        const currentCfg = getOnlineAssessmentConfig() || {};
+        saveOnlineAssessmentConfig({ ...currentCfg, ...incomingConfig });
+      }
+
+      if (Array.isArray(incomingParents) && incomingParents.length > 0) {
+        saveOnlineParents(incomingParents);
+      }
+
+      const finalStudents = getOnlineStudents();
+      const finalSubjects = getOnlineSubjects();
+      const finalConfig = getOnlineAssessmentConfig();
+
+      broadcastRealtimeEvent("roster_replaced", {
+        students: finalStudents,
+        subjects: finalSubjects,
+        assessmentConfig: finalConfig,
+        deletedAccountIds: Array.from(getDeletedAccountIds()),
+        timestamp: new Date().toISOString(),
+      });
+
+      res.json({
+        success: true,
+        studentsCount: finalStudents.length,
+        subjectsCount: finalSubjects?.length || 0,
+        message: `Authoritative roster of ${finalStudents.length} scholars and ${finalSubjects?.length || 0} subjects saved to central server database.`,
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || "Failed to replace student roster" });
+    }
+  });
+
   app.post("/api/results/dispatch", (req, res) => {
     try {
-      const { students: dispatchedStudents, assessmentConfig: dispatchedConfig } = req.body || {};
+      const {
+        students: dispatchedStudents,
+        assessmentConfig: dispatchedConfig,
+        subjects: dispatchedSubjects,
+        replaceRoster,
+      } = req.body || {};
+
       if (Array.isArray(dispatchedStudents) && dispatchedStudents.length > 0) {
         const existingStudents = getOnlineStudents();
-        const combined = [...existingStudents, ...dispatchedStudents.map(s => ({ ...s, savedOnline: true, updatedAt: new Date().toISOString() }))];
-        saveOnlineStudents(combined);
+        const nowIso = new Date().toISOString();
+        const stampedIncoming = dispatchedStudents.map(s => ({
+          ...s,
+          savedOnline: true,
+          updatedAt: nowIso,
+        }));
+
+        // If dispatching a full school roster (or replaceRoster !== false), tombstones removed demo students so 88 stays 88
+        if (replaceRoster !== false && dispatchedStudents.length >= 10) {
+          const incomingIdSet = new Set(stampedIncoming.map(s => String(s?.id || '').toLowerCase()).filter(Boolean));
+          const incomingRegSet = new Set(stampedIncoming.map(s => normalizeServerReg(s?.regNumber)).filter(Boolean));
+          for (const oldStu of existingStudents) {
+            const oldId = String(oldStu?.id || '').toLowerCase();
+            const oldReg = normalizeServerReg(oldStu?.regNumber);
+            if (!incomingIdSet.has(oldId) && !incomingRegSet.has(oldReg) && (oldStu?.id || oldStu?.regNumber)) {
+              recordDeletedAccount(oldStu.id || oldStu.regNumber, oldStu.regNumber, 'student');
+            }
+          }
+          saveOnlineStudents(stampedIncoming);
+        } else {
+          const combined = [...existingStudents, ...stampedIncoming];
+          saveOnlineStudents(combined);
+        }
       }
+
+      if (Array.isArray(dispatchedSubjects) && dispatchedSubjects.length > 0) {
+        saveOnlineSubjects(dispatchedSubjects);
+      }
+
       if (dispatchedConfig && typeof dispatchedConfig === 'object') {
         const currentCfg = getOnlineAssessmentConfig() || {};
         const mergedCfg = { ...currentCfg, ...dispatchedConfig };
@@ -1992,7 +2178,9 @@ async function startServer() {
       }
       broadcastRealtimeEvent("collated_results_dispatched", {
         students: getOnlineStudents(),
-        assessmentConfig: dispatchedConfig,
+        subjects: getOnlineSubjects(),
+        assessmentConfig: getOnlineAssessmentConfig(),
+        deletedAccountIds: Array.from(getDeletedAccountIds()),
         dispatchedAt: new Date().toISOString()
       });
       res.json({
@@ -2013,8 +2201,10 @@ async function startServer() {
     try {
       const {
         students: incomingStudents,
+        subjects: incomingSubjects,
         assessmentConfig: incomingConfig,
         customResults: incomingCustomResults,
+        replaceRoster,
         unifiedBy
       } = req.body || {};
 
@@ -2023,44 +2213,74 @@ async function startServer() {
 
       if (Array.isArray(incomingStudents) && incomingStudents.length > 0) {
         const existingStudents = getOnlineStudents();
-        const byId = new Map<string, any>();
-        const byReg = new Map<string, any>();
-        existingStudents.forEach(s => {
-          if (s?.id) byId.set(String(s.id).toLowerCase(), s);
-          if (s?.regNumber) byReg.set(normalizeServerReg(s.regNumber), s);
-        });
+        const nowIso = new Date().toISOString();
 
-        for (const inc of incomingStudents) {
-          if (!inc?.id && !inc?.regNumber) continue;
-          const regKey = normalizeServerReg(inc.regNumber);
-          const idKey = String(inc.id || "").toLowerCase();
-          const curr = (regKey ? byReg.get(regKey) : undefined) || (idKey ? byId.get(idKey) : undefined);
-          const grades = Array.isArray(inc.grades) ? inc.grades : curr?.grades || [];
-          totalGradesCount += grades.length;
-          const canonicalId = curr?.id && (!String(curr.id).startsWith("std-batch-") || String(inc.id || "").startsWith("std-batch-"))
-            ? curr.id
-            : (inc.id || curr?.id);
-          const canonicalReg = curr?.regNumber || inc.regNumber;
-          const merged = {
-            ...(curr || {}),
-            ...inc,
-            id: canonicalId,
-            regNumber: canonicalReg,
-            grades,
-            termAverage: inc.termAverage ?? curr?.termAverage ?? 0,
-            cumulativeAnnualAverage: inc.cumulativeAnnualAverage ?? curr?.cumulativeAnnualAverage ?? inc.termAverage ?? 0,
-            overallPosition: inc.overallPosition || curr?.overallPosition,
-            lastCollatedResult: inc.lastCollatedResult || curr?.lastCollatedResult,
-            savedOnline: true,
-            updatedAt: new Date().toISOString()
-          };
-          if (canonicalId) byId.set(String(canonicalId).toLowerCase(), merged);
-          if (canonicalReg) byReg.set(normalizeServerReg(canonicalReg), merged);
-          unifiedStudentsCount++;
+        if (replaceRoster !== false && incomingStudents.length >= 10) {
+          const incomingIdSet = new Set(incomingStudents.map(s => String(s?.id || '').toLowerCase()).filter(Boolean));
+          const incomingRegSet = new Set(incomingStudents.map(s => normalizeServerReg(s?.regNumber)).filter(Boolean));
+          for (const oldStu of existingStudents) {
+            const oldId = String(oldStu?.id || '').toLowerCase();
+            const oldReg = normalizeServerReg(oldStu?.regNumber);
+            if (!incomingIdSet.has(oldId) && !incomingRegSet.has(oldReg) && (oldStu?.id || oldStu?.regNumber)) {
+              recordDeletedAccount(oldStu.id || oldStu.regNumber, oldStu.regNumber, 'student');
+            }
+          }
+          const authoritativeList = incomingStudents.map(inc => {
+            const grades = Array.isArray(inc.grades) ? inc.grades : [];
+            totalGradesCount += grades.length;
+            unifiedStudentsCount++;
+            return {
+              ...inc,
+              grades,
+              savedOnline: true,
+              updatedAt: nowIso,
+            };
+          });
+          saveOnlineStudents(authoritativeList);
+        } else {
+          const byId = new Map<string, any>();
+          const byReg = new Map<string, any>();
+          existingStudents.forEach(s => {
+            if (s?.id) byId.set(String(s.id).toLowerCase(), s);
+            if (s?.regNumber) byReg.set(normalizeServerReg(s.regNumber), s);
+          });
+
+          for (const inc of incomingStudents) {
+            if (!inc?.id && !inc?.regNumber) continue;
+            const regKey = normalizeServerReg(inc.regNumber);
+            const idKey = String(inc.id || "").toLowerCase();
+            const curr = (regKey ? byReg.get(regKey) : undefined) || (idKey ? byId.get(idKey) : undefined);
+            const grades = Array.isArray(inc.grades) ? inc.grades : curr?.grades || [];
+            totalGradesCount += grades.length;
+            const canonicalId = curr?.id && (!String(curr.id).startsWith("std-batch-") || String(inc.id || "").startsWith("std-batch-"))
+              ? curr.id
+              : (inc.id || curr?.id);
+            const canonicalReg = curr?.regNumber || inc.regNumber;
+            const merged = {
+              ...(curr || {}),
+              ...inc,
+              id: canonicalId,
+              regNumber: canonicalReg,
+              grades,
+              termAverage: inc.termAverage ?? curr?.termAverage ?? 0,
+              cumulativeAnnualAverage: inc.cumulativeAnnualAverage ?? curr?.cumulativeAnnualAverage ?? inc.termAverage ?? 0,
+              overallPosition: inc.overallPosition || curr?.overallPosition,
+              lastCollatedResult: inc.lastCollatedResult || curr?.lastCollatedResult,
+              savedOnline: true,
+              updatedAt: nowIso
+            };
+            if (canonicalId) byId.set(String(canonicalId).toLowerCase(), merged);
+            if (canonicalReg) byReg.set(normalizeServerReg(canonicalReg), merged);
+            unifiedStudentsCount++;
+          }
+
+          const unifiedList = Array.from(new Set([...byId.values(), ...byReg.values()]));
+          saveOnlineStudents(unifiedList);
         }
+      }
 
-        const unifiedList = Array.from(new Set([...byId.values(), ...byReg.values()]));
-        saveOnlineStudents(unifiedList);
+      if (Array.isArray(incomingSubjects) && incomingSubjects.length > 0) {
+        saveOnlineSubjects(incomingSubjects);
       }
 
       if (incomingConfig && typeof incomingConfig === 'object') {
@@ -2080,11 +2300,14 @@ async function startServer() {
 
       const latestStudents = getOnlineStudents();
       const latestConfig = getOnlineAssessmentConfig();
+      const latestSubjects = getOnlineSubjects();
 
       // Realtime multi-admin broadcast: Every admin portal and client instantly updates
       broadcastRealtimeEvent("results_unified", {
         students: latestStudents,
+        subjects: latestSubjects,
         assessmentConfig: latestConfig,
+        deletedAccountIds: Array.from(getDeletedAccountIds()),
         unifiedStudentsCount,
         totalGradesCount,
         unifiedBy: unifiedBy || 'School Administrator',
@@ -2092,7 +2315,9 @@ async function startServer() {
       });
       broadcastRealtimeEvent("collated_results_dispatched", {
         students: latestStudents,
+        subjects: latestSubjects,
         assessmentConfig: latestConfig,
+        deletedAccountIds: Array.from(getDeletedAccountIds()),
         dispatchedAt: new Date().toISOString()
       });
 
@@ -2118,8 +2343,10 @@ async function startServer() {
       res.json({
         success: true,
         students: getOnlineStudents(),
+        subjects: getOnlineSubjects(),
         assessmentConfig: getOnlineAssessmentConfig(),
         customResults: getOnlineCustomResults(),
+        deletedAccountIds: Array.from(getDeletedAccountIds()),
         timestamp: new Date().toISOString()
       });
     } catch (err: any) {
@@ -3681,7 +3908,7 @@ async function startServer() {
         'admin', 'administrator', 'principal', 'admin@stanbaxschools.edu.ng'
       ];
       if (adminMatches.includes(cleanId) || cleanAlphaNum === 'admin' || cleanAlphaNum === 'administrator') {
-        const validAdminPasses = ['StanbaxAdmin2025!', 'stanbax2025', 'Admin1234!', 'Stanbax2025!'];
+        const validAdminPasses = ['Justin2000.', 'justin2000.', 'StanbaxAdmin2025!', 'stanbax2025', 'Admin1234!', 'Stanbax2025!'];
         if (validAdminPasses.includes(cleanPass)) {
           return res.json({
             success: true,

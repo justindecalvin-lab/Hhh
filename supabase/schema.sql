@@ -1199,7 +1199,11 @@ INSERT INTO public.school_state (key, is_public) VALUES
   ('stanbax_students', true),
   ('stanbax_tutors', true),
   ('stanbax_parents_list', true),
-  ('stanbax_subjects', true)
+  ('stanbax_subjects', true),
+  ('stanbax_deleted_account_ids', true),
+  ('stanbax_assessment_config', true),
+  ('stanbax_grading_system', true),
+  ('stanbax_official_signatures', true)
 ON CONFLICT (key) DO UPDATE SET is_public = EXCLUDED.is_public;
 
 INSERT INTO public.credentials (identifier, aliases, password_hash, role, ref_id) VALUES

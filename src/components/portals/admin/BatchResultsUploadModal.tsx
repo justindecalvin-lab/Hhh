@@ -28,7 +28,7 @@ interface BatchResultsUploadModalProps {
   onNavigateToVault?: () => void;
 }
 
-type TabType = 'download_db' | 'upload' | 'templates' | 'guide';
+type TabType = 'download_db' | 'upload' | 'migration' | 'templates' | 'guide';
 
 interface ParsedRowPreview {
   studentIdOrReg: string;
@@ -87,7 +87,11 @@ export const BatchResultsUploadModal: React.FC<BatchResultsUploadModalProps> = (
     batchUpsertStudentResults, 
     calculateGrade, 
     classes,
-    schoolInfo 
+    schoolInfo,
+    exportDatabaseSnapshot,
+    importDatabaseSnapshot,
+    unifyLocalStorageResultsToDatabase,
+    dispatchCollatedResultsToDashboards
   } = useSchool();
 
   // Build complete, deduplicated list of all subjects created inside the website + tutor/student subjects
@@ -160,6 +164,7 @@ export const BatchResultsUploadModal: React.FC<BatchResultsUploadModalProps> = (
   );
   const [dbCustomSubjectInput, setDbCustomSubjectInput] = useState<string>('');
   const [dbIncludeCurrentScores, setDbIncludeCurrentScores] = useState<boolean>(true);
+  const [dbIncludeLoginsAndParents, setDbIncludeLoginsAndParents] = useState<boolean>(true);
   const [dbCopiedToClipboard, setDbCopiedToClipboard] = useState<boolean>(false);
 
   // Interactive 1st & 2nd test score edits keyed by `${studentId}::${subjectLower}`
@@ -167,6 +172,11 @@ export const BatchResultsUploadModal: React.FC<BatchResultsUploadModalProps> = (
   const [isSavingInlineTests, setIsSavingInlineTests] = useState<boolean>(false);
   const [inlineSaveBanner, setInlineSaveBanner] = useState<string | null>(null);
   const [uploadErrorBanner, setUploadErrorBanner] = useState<string | null>(null);
+  const [replaceEntireRosterOnUpload, setReplaceEntireRosterOnUpload] = useState<boolean>(false);
+  const [autoPublishToPortals, setAutoPublishToPortals] = useState<boolean>(true);
+  const [isPublishingLive, setIsPublishingLive] = useState<boolean>(false);
+  const [migrationBanner, setMigrationBanner] = useState<string | null>(null);
+  const migrationJsonInputRef = React.useRef<HTMLInputElement | null>(null);
 
   // Automatically sync any newly created website subjects into dbSelectedSubjects
   const syncedWebsiteSubjectsRef = React.useRef<Set<string>>(new Set(createdWebsiteSubjectNames.map(s => s.toLowerCase())));
@@ -294,15 +304,79 @@ export const BatchResultsUploadModal: React.FC<BatchResultsUploadModalProps> = (
         selectedSession,
         { assessmentMode: 'tests_only' }
       );
+      if (autoPublishToPortals) {
+        await dispatchCollatedResultsToDashboards(dbClassFilter === 'all' ? 'all' : dbClassFilter);
+      }
       setInlineTestEdits({});
       setInlineSaveBanner(
-        `Saved 1st & 2nd Test scores for ${res.updatedCount} existing scholar(s) without creating duplicates.`
+        `Saved & published 1st & 2nd Test scores live to portals for ${res.updatedCount} existing scholar(s) without creating duplicates.`
       );
     } catch (err: any) {
       setInlineSaveBanner(`Could not save test scores: ${err?.message || 'Unexpected error'}`);
     } finally {
       setIsSavingInlineTests(false);
     }
+  };
+
+  // Publish all current browser results, edited students (e.g. 88 scholars), logins & subjects live to cloud & portals
+  const handlePublishEverythingLiveNow = async () => {
+    if (isPublishingLive) return;
+    setIsPublishingLive(true);
+    setMigrationBanner(null);
+    try {
+      const unifyRes = await unifyLocalStorageResultsToDatabase();
+      const pubRes = await dispatchCollatedResultsToDashboards('all');
+      setMigrationBanner(
+        `LIVE SYNC COMPLETE: ${exportStudents.length} edited scholars, student logins, ${allWebsiteSubjects.length} subjects, and ${pubRes.dispatchedCount} results are now live across all browsers and Student/Parent Portals! (${unifyRes.message})`
+      );
+    } catch (err: any) {
+      setMigrationBanner(`Live publish error: ${err?.message || 'Could not reach cloud server'}`);
+    } finally {
+      setIsPublishingLive(false);
+    }
+  };
+
+  // Export complete JSON migration package (edited students, logins, created subjects, classes, results)
+  const handleDownloadFullMigrationJson = () => {
+    try {
+      const jsonStr = exportDatabaseSnapshot();
+      const timestamp = new Date().toISOString().split('T')[0];
+      downloadTextFile(
+        jsonStr,
+        `Stanbax_Complete_Migration_${exportStudents.length}_Scholars_Logins_Subjects_${timestamp}.json`,
+        'application/json;charset=utf-8;'
+      );
+      setMigrationBanner(
+        `Downloaded Complete Migration Package (.json) containing ${exportStudents.length} edited scholars, all student logins/passwords, and ${websiteSubjects.length} website subjects.`
+      );
+    } catch (err: any) {
+      setMigrationBanner(`Export failed: ${err?.message || 'Unexpected error'}`);
+    }
+  };
+
+  // Import complete JSON migration package on a new hosting provider or browser
+  const handleImportFullMigrationJson = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async event => {
+      try {
+        const content = event.target?.result as string;
+        const res = importDatabaseSnapshot(content);
+        if (res.success) {
+          setMigrationBanner(`${res.message} Publishing live to all portals...`);
+          await unifyLocalStorageResultsToDatabase();
+          await dispatchCollatedResultsToDashboards('all');
+          setMigrationBanner(`${res.message} All restored students, logins, subjects, and results are now live!`);
+        } else {
+          setMigrationBanner(res.message);
+        }
+      } catch (err: any) {
+        setMigrationBanner(`Failed to import migration file: ${err?.message || 'Invalid JSON'}`);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
   };
 
   // CSV escape helper
@@ -315,21 +389,32 @@ export const BatchResultsUploadModal: React.FC<BatchResultsUploadModalProps> = (
     return `"${str}"`;
   };
 
-  // Generate downloadable CSV string for enrolled scholars
+  // Generate downloadable CSV string for enrolled scholars (includes password & parent fields when dbIncludeLoginsAndParents is enabled)
   const generatedDatabaseCsv = useMemo(() => {
     const lines: string[] = [];
+    const baseHeaders = dbIncludeLoginsAndParents
+      ? ['registration_no', 'full_name', 'grade_level', 'password', 'parent_name', 'parent_phone']
+      : ['registration_no', 'full_name', 'grade_level'];
 
     if (dbLayoutMode === 'single_column') {
-      // Single column per subject: registration_no,full_name,grade_level,Mathematics,English Language,...
-      const headers = ['registration_no', 'full_name', 'grade_level', ...dbSelectedSubjects];
+      const headers = [...baseHeaders, ...dbSelectedSubjects];
       lines.push(headers.map(escapeCsv).join(','));
 
       exportStudents.forEach(st => {
-        const row = [
-          st.regNumber || st.id,
-          st.name,
-          st.grade || 'SSS 1 Science'
-        ];
+        const row = dbIncludeLoginsAndParents
+          ? [
+              st.regNumber || st.id,
+              st.name,
+              st.grade || 'SSS 1 Science',
+              st.password || 'stanbax2025',
+              st.parentName || '',
+              st.parentPhone || ''
+            ]
+          : [
+              st.regNumber || st.id,
+              st.name,
+              st.grade || 'SSS 1 Science'
+            ];
 
         dbSelectedSubjects.forEach(sub => {
           const { ca1, ca2 } = getStudentSubjectTestScores(st, sub);
@@ -343,8 +428,7 @@ export const BatchResultsUploadModal: React.FC<BatchResultsUploadModalProps> = (
         lines.push(row.map(escapeCsv).join(','));
       });
     } else {
-      // Split 1st & 2nd Test columns format: registration_no,full_name,grade_level,<Subject> (1st Test),<Subject> (2nd Test),...
-      const headers = ['registration_no', 'full_name', 'grade_level'];
+      const headers = [...baseHeaders];
       dbSelectedSubjects.forEach(sub => {
         headers.push(`${sub} (1st Test)`);
         headers.push(`${sub} (2nd Test)`);
@@ -352,11 +436,20 @@ export const BatchResultsUploadModal: React.FC<BatchResultsUploadModalProps> = (
       lines.push(headers.map(escapeCsv).join(','));
 
       exportStudents.forEach(st => {
-        const row = [
-          st.regNumber || st.id,
-          st.name,
-          st.grade || 'SSS 1 Science'
-        ];
+        const row = dbIncludeLoginsAndParents
+          ? [
+              st.regNumber || st.id,
+              st.name,
+              st.grade || 'SSS 1 Science',
+              st.password || 'stanbax2025',
+              st.parentName || '',
+              st.parentPhone || ''
+            ]
+          : [
+              st.regNumber || st.id,
+              st.name,
+              st.grade || 'SSS 1 Science'
+            ];
 
         dbSelectedSubjects.forEach(sub => {
           const { ca1, ca2 } = getStudentSubjectTestScores(st, sub);
@@ -369,7 +462,7 @@ export const BatchResultsUploadModal: React.FC<BatchResultsUploadModalProps> = (
     }
 
     return lines.join('\n');
-  }, [exportStudents, dbLayoutMode, dbSelectedSubjects, dbIncludeCurrentScores, inlineTestEdits]);
+  }, [exportStudents, dbLayoutMode, dbSelectedSubjects, dbIncludeCurrentScores, dbIncludeLoginsAndParents, inlineTestEdits]);
 
   // Download CSV trigger
   const handleDownloadDatabaseCsv = () => {
@@ -790,8 +883,9 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
     const nameIdx = headers.findIndex(h => (h.includes('name') && !h.includes('parent')) || h === 'student' || h === 'scholar');
     const emailIdx = headers.findIndex(h => h.includes('email') || h.includes('mail'));
     const gradeIdx = headers.findIndex(h => h.includes('grade') || h.includes('class') || h.includes('level'));
+    const passwordIdx = headers.findIndex(h => h === 'password' || h === 'student_password' || h === 'student password' || h === 'passcode' || h === 'pin');
     const parentNameIdx = headers.findIndex(h => h.includes('parent') && h.includes('name'));
-    const parentPhoneIdx = headers.findIndex(h => h.includes('parent') && (h.includes('phone') || h.includes('mobile')));
+    const parentPhoneIdx = headers.findIndex(h => h.includes('parent') && (h.includes('phone') || h.includes('mobile') || h.includes('login')));
 
     // Check if narrow format: contains "subject" and "score"/"ca1"/"exam" headers
     const subjectIdx = headers.findIndex(h => h === 'subject' || h === 'course' || h === 'subject_name');
@@ -826,6 +920,7 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
           full_name: rawName,
           email: rawEmail,
           grade_level: rawGrade,
+          password: passwordIdx >= 0 ? cols[passwordIdx] : undefined,
           parent_name: parentNameIdx >= 0 ? cols[parentNameIdx] : undefined,
           parent_phone: parentPhoneIdx >= 0 ? cols[parentPhoneIdx] : undefined,
           results: [
@@ -845,7 +940,7 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
 
     // Wide format: parse subject columns (including 1st Test & 2nd Test columns for all website subjects)
     const metadataIndexes = new Set(
-      [serialIdx, idIdx, nameIdx, emailIdx, gradeIdx, parentNameIdx, parentPhoneIdx].filter(i => i >= 0)
+      [serialIdx, idIdx, nameIdx, emailIdx, gradeIdx, passwordIdx, parentNameIdx, parentPhoneIdx].filter(i => i >= 0)
     );
 
     interface SubjectColDef {
@@ -1013,6 +1108,7 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
         full_name: rawName,
         email: rawEmail,
         grade_level: rawGrade,
+        password: passwordIdx >= 0 ? cols[passwordIdx] : undefined,
         parent_name: parentNameIdx >= 0 ? cols[parentNameIdx] : undefined,
         parent_phone: parentPhoneIdx >= 0 ? cols[parentPhoneIdx] : undefined,
         results
@@ -1117,16 +1213,53 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
     setUploadErrorBanner(null);
 
     try {
+      // Ensure any custom subject columns in the uploaded CSV are also added to websiteSubjects so they remain intact
+      const uploadedSubNames = new Set<string>();
+      rawRecords.forEach(r => {
+        (r.results || []).forEach((sub: any) => {
+          if (sub?.subject) uploadedSubNames.add(String(sub.subject).trim());
+        });
+      });
+      uploadedSubNames.forEach(subName => {
+        const exists = (websiteSubjects || []).some(
+          ws => ws?.name?.trim().toLowerCase() === subName.toLowerCase()
+        );
+        if (!exists && typeof addSubject === 'function') {
+          const code = subName
+            .replace(/[^A-Za-z0-9 ]/g, '')
+            .split(/\s+/)
+            .filter(Boolean)
+            .map(w => w.slice(0, 3).toUpperCase())
+            .join('')
+            .slice(0, 6) || 'SUB';
+          addSubject({
+            name: subName,
+            code: `${code}101`,
+            department: 'General',
+            isCore: true,
+          });
+        }
+      });
+
       const result = await batchUpsertStudentResults(
         rawRecords,
         selectedTerm,
         selectedSession,
         {
-          assessmentMode: uploadAssessmentScope
+          assessmentMode: uploadAssessmentScope,
+          replaceEntireRoster: replaceEntireRosterOnUpload
         }
       );
 
-      setAuditResult(result);
+      if (autoPublishToPortals) {
+        await unifyLocalStorageResultsToDatabase();
+        await dispatchCollatedResultsToDashboards('all');
+      }
+
+      setAuditResult({
+        ...result,
+        message: `${result.message}${autoPublishToPortals ? ' Published live to Student & Parent Portals across all devices!' : ''}`
+      });
     } catch (err: any) {
       setUploadErrorBanner(`Batch upload failed: ${err?.message || 'Unexpected error'}`);
     } finally {
@@ -1303,6 +1436,19 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
 
             <button
               type="button"
+              onClick={() => setActiveTab('migration')}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
+                activeTab === 'migration'
+                  ? 'bg-amber-400 text-blue-950 shadow-md font-black'
+                  : 'bg-emerald-500/20 text-emerald-200 border border-emerald-400/30 hover:bg-emerald-500/30'
+              }`}
+            >
+              <Database className="w-3.5 h-3.5" />
+              <span>3. Hosting Migration &amp; Live Publish</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setActiveTab('templates')}
               className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 cursor-pointer ${
                 activeTab === 'templates'
@@ -1311,7 +1457,7 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
               }`}
             >
               <Copy className="w-3.5 h-3.5" />
-              <span>3. Sample Formats</span>
+              <span>4. Sample Formats</span>
             </button>
 
             <button
@@ -1324,13 +1470,80 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
               }`}
             >
               <HelpCircle className="w-3.5 h-3.5" />
-              <span>4. Step-by-Step Guide</span>
+              <span>5. Step-by-Step Guide</span>
             </button>
           </div>
         </div>
 
         {/* Modal Main Content Area */}
         <div className="p-6 overflow-y-auto space-y-6 flex-1 bg-slate-50">
+          <input
+            ref={migrationJsonInputRef}
+            type="file"
+            accept=".json"
+            onChange={handleImportFullMigrationJson}
+            className="hidden"
+          />
+
+          {/* Quick Live Sync & Migration Bar */}
+          <div className="bg-gradient-to-r from-emerald-900 via-teal-900 to-slate-900 text-white p-4 rounded-2xl shadow-sm flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded-full bg-amber-400 text-slate-950 text-[10px] font-black uppercase">
+                  Cross-Device &amp; Hosting Sync
+                </span>
+                <span className="text-xs font-black">
+                  Current Browser Roster: {exportStudents.length} Scholars • {allDisplaySubjects.length} Website Subjects
+                </span>
+              </div>
+              <p className="text-[11px] text-emerald-100/90">
+                Publish this browser&apos;s exact edited students ({exportStudents.length}), logins, subjects, and results live to all browsers &amp; Student Portals, or download a portable backup for your new hosting provider.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap shrink-0">
+              <button
+                type="button"
+                disabled={isPublishingLive}
+                onClick={handlePublishEverythingLiveNow}
+                className="px-3.5 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-xs shadow-sm transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isPublishingLive ? 'animate-spin' : ''}`} />
+                <span>{isPublishingLive ? 'Publishing Live...' : `Push ${exportStudents.length} Scholars & Results Live`}</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadFullMigrationJson}
+                className="px-3 py-2 rounded-xl bg-white/15 hover:bg-white/25 text-white font-bold text-xs border border-white/20 transition flex items-center gap-1.5 cursor-pointer"
+              >
+                <Download className="w-3.5 h-3.5 text-amber-300" />
+                <span>Backup All (.json)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => migrationJsonInputRef.current?.click()}
+                className="px-3 py-2 rounded-xl bg-white/15 hover:bg-white/25 text-white font-bold text-xs border border-white/20 transition flex items-center gap-1.5 cursor-pointer"
+              >
+                <Upload className="w-3.5 h-3.5 text-emerald-300" />
+                <span>Restore Backup (.json)</span>
+              </button>
+            </div>
+          </div>
+
+          {migrationBanner && (
+            <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-300 text-xs font-bold text-emerald-950 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>{migrationBanner}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMigrationBanner(null)}
+                className="text-emerald-800 hover:underline text-[11px] shrink-0"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
 
           {/* =============================================================== */}
           {/* TAB 1: DOWNLOAD STUDENTS DATABASE AS CSV & 1ST/2ND TEST SPACES */}
@@ -1399,9 +1612,9 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
                     </select>
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">Pre-Fill Existing Test Data</label>
-                    <label className="flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 cursor-pointer">
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-bold text-slate-700 mb-1">CSV Export Options</label>
+                    <label className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 cursor-pointer">
                       <input
                         type="checkbox"
                         checked={dbIncludeCurrentScores}
@@ -1409,6 +1622,15 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
                         className="rounded text-blue-600 focus:ring-blue-500 h-4 w-4"
                       />
                       <span className="text-xs text-slate-700 font-medium">Pre-fill current 1st &amp; 2nd Test scores</span>
+                    </label>
+                    <label className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={dbIncludeLoginsAndParents}
+                        onChange={e => setDbIncludeLoginsAndParents(e.target.checked)}
+                        className="rounded text-blue-600 focus:ring-blue-500 h-4 w-4"
+                      />
+                      <span className="text-xs text-slate-700 font-medium">Include Student Passwords &amp; Parent Logins</span>
                     </label>
                   </div>
                 </div>
@@ -1715,6 +1937,35 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
                     </div>
                   </div>
                 )}
+
+                {/* Live Publish & Roster Lock Options */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-slate-100">
+                  <label className="flex items-start gap-2.5 p-3 rounded-2xl border border-blue-200 bg-blue-50/50 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={autoPublishToPortals}
+                      onChange={e => setAutoPublishToPortals(e.target.checked)}
+                      className="rounded text-blue-700 focus:ring-blue-600 h-4 w-4 mt-0.5"
+                    />
+                    <div className="text-xs">
+                      <span className="font-black text-blue-950 block">Publish Live to Student &amp; Parent Portals Immediately</span>
+                      <span className="text-[11px] text-slate-600">Pushes uploaded results directly to the live cloud database so students see them on every device (not just local storage).</span>
+                    </div>
+                  </label>
+
+                  <label className="flex items-start gap-2.5 p-3 rounded-2xl border border-amber-200 bg-amber-50/50 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={replaceEntireRosterOnUpload}
+                      onChange={e => setReplaceEntireRosterOnUpload(e.target.checked)}
+                      className="rounded text-amber-700 focus:ring-amber-600 h-4 w-4 mt-0.5"
+                    />
+                    <div className="text-xs">
+                      <span className="font-black text-amber-950 block">Lock &amp; Replace Entire Student Roster with Uploaded File</span>
+                      <span className="text-[11px] text-slate-600">Enable when migrating all edited students (e.g. 88 scholars) so unincluded demo students are permanently removed across all browsers.</span>
+                    </div>
+                  </label>
+                </div>
               </div>
 
               {uploadErrorBanner && (
@@ -2074,7 +2325,110 @@ SBS/2026/NEW01,Chioma Nwachukwu,SSS 1 Science,${r3}`;
           )}
 
           {/* =============================================================== */}
-          {/* TAB 3: SAMPLE TEMPLATES & FORMATS */}
+          {/* TAB 3: HOSTING MIGRATION & LIVE CLOUD PUBLISH */}
+          {/* =============================================================== */}
+          {activeTab === 'migration' && (
+            <div className="space-y-6 animate-fade-in">
+              <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm space-y-5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+                  <div>
+                    <h3 className="text-base font-black text-slate-900 flex items-center gap-2">
+                      <Database className="w-5 h-5 text-emerald-700" />
+                      <span>Complete Hosting Migration &amp; Multi-Browser Sync Center</span>
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Keep all your edited scholars ({exportStudents.length} scholars), student login passwords, registration numbers, and created subjects ({allDisplaySubjects.length} subjects) 100% intact across browsers or when moving to a new hosting provider.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  {/* Card 1: Push Live from Current Browser */}
+                  <div className="p-5 rounded-2xl bg-emerald-50/70 border border-emerald-200 flex flex-col justify-between space-y-4">
+                    <div className="space-y-2">
+                      <span className="inline-block px-2.5 py-0.5 rounded-full bg-emerald-700 text-white text-[10px] font-black uppercase">
+                        Fix Browser Mismatch (88 vs 106)
+                      </span>
+                      <h4 className="text-sm font-black text-slate-900">
+                        1. Push This Browser&apos;s Data Live to All Devices
+                      </h4>
+                      <p className="text-xs text-slate-600 leading-relaxed">
+                        If this browser has your correct <strong>{exportStudents.length} edited scholars</strong> and created subjects, click below to lock the cloud database and Student Portals to this exact roster.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={isPublishingLive}
+                      onClick={handlePublishEverythingLiveNow}
+                      className="w-full py-2.5 px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white font-black text-xs shadow-sm transition flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-4 h-4 ${isPublishingLive ? 'animate-spin' : ''}`} />
+                      <span>{isPublishingLive ? 'Syncing to Cloud...' : `Lock & Publish ${exportStudents.length} Scholars Live`}</span>
+                    </button>
+                  </div>
+
+                  {/* Card 2: Download Full Migration File */}
+                  <div className="p-5 rounded-2xl bg-blue-50/70 border border-blue-200 flex flex-col justify-between space-y-4">
+                    <div className="space-y-2">
+                      <span className="inline-block px-2.5 py-0.5 rounded-full bg-blue-900 text-white text-[10px] font-black uppercase">
+                        Step 1 for New Hosting Provider
+                      </span>
+                      <h4 className="text-sm font-black text-slate-900">
+                        2. Download Complete Migration File (.json &amp; .csv)
+                      </h4>
+                      <p className="text-xs text-slate-600 leading-relaxed">
+                        Exports all <strong>{exportStudents.length} edited students</strong>, their login passwords, parent accounts, all <strong>{allDisplaySubjects.length} created subjects</strong>, and collated results.
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      <button
+                        type="button"
+                        onClick={handleDownloadFullMigrationJson}
+                        className="w-full py-2.5 px-4 rounded-xl bg-blue-900 hover:bg-blue-950 text-white font-black text-xs shadow-sm transition flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <Download className="w-4 h-4 text-amber-400" />
+                        <span>Download Full Migration (.json)</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleDownloadDatabaseCsv}
+                        className="w-full py-2 px-4 rounded-xl bg-white hover:bg-blue-50 text-blue-900 border border-blue-300 font-bold text-xs transition flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <FileSpreadsheet className="w-3.5 h-3.5" />
+                        <span>Download Students + Logins + Subjects (.csv)</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Card 3: Import Full Migration File */}
+                  <div className="p-5 rounded-2xl bg-amber-50/70 border border-amber-200 flex flex-col justify-between space-y-4">
+                    <div className="space-y-2">
+                      <span className="inline-block px-2.5 py-0.5 rounded-full bg-amber-600 text-white text-[10px] font-black uppercase">
+                        Step 2 on New Host / Device
+                      </span>
+                      <h4 className="text-sm font-black text-slate-900">
+                        3. Import &amp; Restore Migration Backup (.json)
+                      </h4>
+                      <p className="text-xs text-slate-600 leading-relaxed">
+                        Upload your <code className="font-mono font-bold">.json</code> backup file on your new hosting provider or second browser. Replaces demo students with your exact edited roster, logins, and subjects.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => migrationJsonInputRef.current?.click()}
+                      className="w-full py-2.5 px-4 rounded-xl bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs shadow-sm transition flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <Upload className="w-4 h-4" />
+                      <span>Upload Migration Backup (.json)</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* =============================================================== */}
+          {/* TAB 4: SAMPLE TEMPLATES & FORMATS */}
           {/* =============================================================== */}
           {activeTab === 'templates' && (
             <div className="space-y-6 animate-fade-in">

@@ -307,9 +307,37 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
   // Dynamic values tailored to the selected session & term
   const displayClass = historicalSession ? historicalSession.classEnrolled : student.grade;
 
-  // Records are stored on the 10/10/10/70 scale; when viewing a past term
-  // we project that term's total onto the current CA/Exam split.
+  // Preserve actual CA1, CA2, CA3, and Exam scores when viewing the active term or published collated results;
+  // only project onto a synthetic scale when viewing a historical term total that has no itemized CA/Exam breakdown.
   const projectToTermScale = (g: GradeRecord, termKey: '1st Term' | '2nd Term' | '3rd Term'): GradeRecord => {
+    const isViewingActiveTerm = isCurrentSession && termKey === ((schoolInfo.activeTerm as any) || '1st Term');
+    const hasActualBreakdown = (Number(g.ca1 || 0) + Number(g.ca2 || 0) + Number(g.ca3 || 0) + Number(g.exam || 0)) > 0;
+
+    if (isViewingActiveTerm || hasActualBreakdown) {
+      const ca1 = Number(g.ca1 || 0);
+      const ca2 = Number(g.ca2 || 0);
+      const ca3 = Number(g.ca3 || 0);
+      const exam = Number(g.exam || 0);
+      const tot = (ca1 + ca2 + ca3 + exam) || Number(
+        termKey === '1st Term'
+          ? (g.term1Total ?? g.total)
+          : termKey === '2nd Term'
+          ? (g.term2Total ?? g.total)
+          : (g.term3Total ?? g.total)
+      ) || 0;
+      const { grade, remark } = calculateGrade(tot);
+      return {
+        ...g,
+        ca1,
+        ca2,
+        ca3,
+        exam,
+        total: tot,
+        grade: g.grade || grade,
+        remark: g.remark || remark,
+      };
+    }
+
     const tot = termKey === '1st Term'
       ? (g.term1Total ?? g.total)
       : termKey === '2nd Term'
@@ -321,13 +349,24 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
     return { ...g, ca1: caEach, ca2: caEach, ca3: caEach, exam, total: tot, grade, remark };
   };
 
+  const activeSourceGrades: GradeRecord[] =
+    isCurrentSession &&
+    student.lastCollatedResult &&
+    Array.isArray(student.lastCollatedResult.grades) &&
+    student.lastCollatedResult.grades.length > 0 &&
+    (!student.lastCollatedResult.term || student.lastCollatedResult.term === currentTermKey)
+      ? student.lastCollatedResult.grades
+      : grades;
+
   const displayGrades: GradeRecord[] = historicalTermRecord
     ? historicalTermRecord.grades
-    : grades.map(g => projectToTermScale(g, currentTermKey));
+    : activeSourceGrades.map(g => projectToTermScale(g, currentTermKey));
 
   const displayTermAverage = historicalTermRecord
     ? historicalTermRecord.termAverage
-    : (currentTermKey === '1st Term'
+    : (isCurrentSession && student.lastCollatedResult?.termAverage && (!student.lastCollatedResult.term || student.lastCollatedResult.term === currentTermKey)
+        ? student.lastCollatedResult.termAverage
+        : currentTermKey === '1st Term'
         ? (student.term1Average ?? student.termAverage)
         : currentTermKey === '2nd Term'
         ? (student.term2Average ?? student.termAverage)
