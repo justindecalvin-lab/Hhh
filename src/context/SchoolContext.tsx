@@ -21,6 +21,9 @@ import {
   lastLocalMutationAt,
   markLocalMutation,
   hasPendingRemoteWrites,
+  setLocalStorageSilent,
+  isSeededDemoGrade,
+  stripDemoGradesFromStudent,
 } from '../lib/supabase';
 import { 
   AppImages, 
@@ -2759,46 +2762,132 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   });
 
-  const student = students.find(s => s.id === activeStudentId) || (() => {
+  const student = (() => {
+    const savedReg = (() => {
+      try {
+        return sessionStorage.getItem('stanbax_student_reg') || localStorage.getItem('stanbax_student_reg') || '';
+      } catch {
+        return '';
+      }
+    })();
+    const normActive = normalizeRegForUpsert(activeStudentId);
+    const normSavedReg = normalizeRegForUpsert(savedReg);
+
+    const directMatch = students.find(s => {
+      if (!s) return false;
+      if (s.id === activeStudentId) return true;
+      const sRegNorm = normalizeRegForUpsert(s.regNumber);
+      if (normActive && sRegNorm && sRegNorm === normActive) return true;
+      if (normSavedReg && sRegNorm && sRegNorm === normSavedReg) return true;
+      return false;
+    });
+    if (directMatch) {
+      return stripDemoGradesFromStudent(directMatch);
+    }
+
     try {
       const cached = sessionStorage.getItem('stanbax_active_student_cache');
       if (cached) {
         const parsed = JSON.parse(cached);
-        if (parsed?.id === activeStudentId) return parsed as StudentProfile;
+        if (parsed) {
+          const parsedRegNorm = normalizeRegForUpsert(parsed.regNumber);
+          const fromRosterByReg = parsedRegNorm
+            ? students.find(s => normalizeRegForUpsert(s.regNumber) === parsedRegNorm)
+            : undefined;
+          if (fromRosterByReg) {
+            return stripDemoGradesFromStudent(fromRosterByReg);
+          }
+          if (parsed.id === activeStudentId || (normSavedReg && parsedRegNorm === normSavedReg)) {
+            return stripDemoGradesFromStudent(parsed as StudentProfile);
+          }
+        }
       }
     } catch {}
-    return null;
-  })() || students[0] || DEMO_STUDENT;
+
+    return stripDemoGradesFromStudent(students[0] || DEMO_STUDENT);
+  })();
 
   const switchActiveStudent = (id: string) => {
     setActiveStudentId(id);
   };
 
   const updateStudent = (id: string, updatedData: Partial<StudentProfile>) => {
+    const nowIso = new Date().toISOString();
+    const targetNormReg = normalizeRegForUpsert((updatedData as any)?.regNumber || id);
+    let updatedStudentRecord: StudentProfile | null = null;
+    let nextStudentsSnapshot: StudentProfile[] = [];
+
     setStudents(prev => {
       const updated = prev.map(s => {
-        if (s.id !== id) return s;
-        const next = { ...s, ...updatedData };
+        const isMatch =
+          s.id === id ||
+          (targetNormReg && normalizeRegForUpsert(s.regNumber) === targetNormReg);
+        if (!isMatch) return s;
+
+        const cleanedBase = stripDemoGradesFromStudent(s);
+        const next: StudentProfile = stripDemoGradesFromStudent({
+          ...cleanedBase,
+          ...updatedData,
+          updatedAt: nowIso,
+        });
         // Keep the join key in step when a grade label is edited directly
         if (updatedData.grade !== undefined && updatedData.classId === undefined) {
           next.classId = resolveClassId(updatedData.grade) || s.classId;
         }
+        if (next.lastCollatedResult) {
+          next.lastCollatedResult = {
+            ...next.lastCollatedResult,
+            dispatchedAt: nowIso,
+            grades: Array.isArray(next.grades) ? next.grades : next.lastCollatedResult.grades,
+          };
+        }
+        updatedStudentRecord = next;
         return next;
       });
+
+      nextStudentsSnapshot = deduplicateStudentsByRegistration(updated);
+      latestStudentsRef.current = nextStudentsSnapshot;
+
+      markLocalMutation();
       try {
-        localStorage.setItem('stanbax_students', JSON.stringify(updated));
+        localStorage.setItem('stanbax_students', JSON.stringify(nextStudentsSnapshot));
+        if (updatedStudentRecord && (updatedStudentRecord as StudentProfile).id === activeStudentId) {
+          sessionStorage.setItem('stanbax_active_student_cache', JSON.stringify(updatedStudentRecord));
+        }
       } catch {}
-      broadcastLocalStateChange('stanbax_students', updated);
-      void syncStateOnline('stanbax_students', updated);
-      return updated;
+      broadcastLocalStateChange('stanbax_students', nextStudentsSnapshot);
+      void syncStateOnline('stanbax_students', nextStudentsSnapshot);
+      void forceSyncCollatedResultsToDatabase({
+        students: nextStudentsSnapshot,
+        assessmentConfig,
+        subjects,
+        adminPassword,
+      });
+      return nextStudentsSnapshot;
     });
 
-    // Also persist directly to online server database
+    const recordToSend = updatedStudentRecord || { ...updatedData, id, updatedAt: nowIso };
+
+    // Persist full student object directly to online server database (upserts if missing)
     void fetch(`/api/students/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updatedData)
+      body: JSON.stringify(recordToSend)
     }).catch(() => {});
+
+    // Also update student credential & login aliases (including updated student name / email / regNumber) in Supabase
+    if (updatedStudentRecord) {
+      const stu = updatedStudentRecord as StudentProfile;
+      if (stu.regNumber) {
+        void remoteCreateCredential(
+          stu.regNumber,
+          stu.password || 'stanbax2025',
+          'student',
+          stu.id,
+          [stu.email || '', stu.name?.toLowerCase().trim() || ''].filter(Boolean)
+        );
+      }
+    }
   };
 
   const setStudentIntensiveCalvinSupport = (
@@ -2957,7 +3046,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             );
             // Put onlineFiltered first and prevFiltered second so local changes take precedence unless online record has a newer timestamp
             const deduplicated = deduplicateStudentsByRegistration([...onlineFiltered, ...prevFiltered]);
-            try { localStorage.setItem('stanbax_students', JSON.stringify(deduplicated)); } catch {}
+            setLocalStorageSilent('stanbax_students', JSON.stringify(deduplicated));
             return deduplicated;
           });
           setOnlineStudentsSynced(true);
@@ -2984,7 +3073,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             });
             if (!added) return prev;
             const merged = Array.from(seen.values());
-            try { localStorage.setItem('stanbax_subjects', JSON.stringify(merged)); } catch {}
+            setLocalStorageSilent('stanbax_subjects', JSON.stringify(merged));
             return merged;
           });
         }
@@ -2998,7 +3087,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         if (cfgData.success && cfgData.config && typeof cfgData.config === 'object') {
           setAssessmentConfig(prev => {
             const merged = { ...prev, ...cfgData.config };
-            try { localStorage.setItem('stanbax_assessment_config', JSON.stringify(merged)); } catch {}
+            setLocalStorageSilent('stanbax_assessment_config', JSON.stringify(merged));
             return merged;
           });
         }
@@ -3338,7 +3427,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setStudents(prev => {
       const updated = prev.map(s => {
         if (s.id !== targetId) return s;
-        const existing = s.grades || [];
+        const existing = (s.grades || []).filter(g => g && g.subject && !isSeededDemoGrade(g));
         const idx = existing.findIndex(g => g.subject.toLowerCase() === subject.toLowerCase());
 
         let nextGrades: GradeRecord[];
@@ -3364,8 +3453,9 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
               term1Total: t1,
               term2Total: t2,
               term3Total: t3,
-              annualAverage: annualAvg
-            };
+              annualAverage: annualAvg,
+              isRealScore: true,
+            } as GradeRecord;
           });
         } else {
           const record: GradeRecord = {
@@ -3378,8 +3468,9 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             total,
             grade,
             remark,
-            annualAverage: total
-          };
+            annualAverage: total,
+            isRealScore: true,
+          } as GradeRecord;
           if (activeTerm === '1st Term') record.term1Total = total;
           else if (activeTerm === '2nd Term') record.term2Total = total;
           else if (activeTerm === '3rd Term') record.term3Total = total;
@@ -3393,6 +3484,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         return {
           ...s,
           grades: nextGrades,
+          hasUploadedResults: true,
           termAverage: avg,
           cumulativeAnnualAverage: annualAvg,
           ...(activeTerm === '1st Term' ? { term1Average: avg } : {}),
@@ -3457,7 +3549,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         const total = ca1 + ca2 + ca3 + exam;
         const { grade, remark } = calculateGrade(total);
 
-        const existing = s.grades || [];
+        const existing = (s.grades || []).filter(g => g && g.subject && !isSeededDemoGrade(g));
         const idx = existing.findIndex(g => g.subject.toLowerCase() === subject.toLowerCase());
 
         let nextGrades: GradeRecord[];
@@ -3478,6 +3570,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
               ca3,
               exam,
               total,
+              isRealScore: true,
               grade,
               remark,
               term1Total: t1,
@@ -3758,7 +3851,20 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
 
       // Parse subjects
-      const parsedSubjects: Array<{ subject: string; ca1: number; ca2: number; ca3: number; exam: number; total: number; grade: string; remark: string }> = [];
+      const parsedSubjects: Array<{
+        subject: string;
+        ca1: number;
+        ca2: number;
+        ca3: number;
+        exam: number;
+        total: number;
+        grade: string;
+        remark: string;
+        hasCa1?: boolean;
+        hasCa2?: boolean;
+        hasCa3?: boolean;
+        hasExam?: boolean;
+      }> = [];
 
       if (Array.isArray(rec.results)) {
         for (const sub of rec.results) {
@@ -3769,7 +3875,20 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           const exam = Number(sub.exam || 0);
           const total = (ca1 + ca2 + ca3 + exam) || Number(sub.score || (sub as any).total || 0);
           const calc = calculateGrade(total);
-          parsedSubjects.push({ subject: sub.subject, ca1, ca2, ca3, exam, total, grade: (sub as any).grade || calc.grade, remark: (sub as any).remark || calc.remark });
+          parsedSubjects.push({
+            subject: sub.subject,
+            ca1,
+            ca2,
+            ca3,
+            exam,
+            total,
+            grade: (sub as any).grade || calc.grade,
+            remark: (sub as any).remark || calc.remark,
+            hasCa1: (sub as any).hasCa1 !== undefined ? Boolean((sub as any).hasCa1) : true,
+            hasCa2: (sub as any).hasCa2 !== undefined ? Boolean((sub as any).hasCa2) : true,
+            hasCa3: (sub as any).hasCa3 !== undefined ? Boolean((sub as any).hasCa3) : ca3 > 0,
+            hasExam: (sub as any).hasExam !== undefined ? Boolean((sub as any).hasExam) : exam > 0 || !isTestsOnly,
+          });
         }
       } else if (typeof rec.subjects === 'object' && rec.subjects !== null) {
         if (Array.isArray(rec.subjects)) {
@@ -3781,45 +3900,78 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             const exam = Number(sub.exam || 0);
             const total = (ca1 + ca2 + ca3 + exam) || Number((sub as any).score || (sub as any).total || 0);
             const calc = calculateGrade(total);
-            parsedSubjects.push({ subject: sub.subject, ca1, ca2, ca3, exam, total, grade: (sub as any).grade || calc.grade, remark: (sub as any).remark || calc.remark });
+            parsedSubjects.push({
+              subject: sub.subject,
+              ca1,
+              ca2,
+              ca3,
+              exam,
+              total,
+              grade: (sub as any).grade || calc.grade,
+              remark: (sub as any).remark || calc.remark,
+              hasCa1: (sub as any).hasCa1 !== undefined ? Boolean((sub as any).hasCa1) : true,
+              hasCa2: (sub as any).hasCa2 !== undefined ? Boolean((sub as any).hasCa2) : true,
+              hasCa3: (sub as any).hasCa3 !== undefined ? Boolean((sub as any).hasCa3) : ca3 > 0,
+              hasExam: (sub as any).hasExam !== undefined ? Boolean((sub as any).hasExam) : exam > 0 || !isTestsOnly,
+            });
           }
         } else {
           for (const [subName, scoreVal] of Object.entries(rec.subjects)) {
             const num = Number(scoreVal) || 0;
             const calc = calculateGrade(num);
-            parsedSubjects.push({ subject: subName, ca1: Math.round(num * 0.2), ca2: Math.round(num * 0.2), ca3: 0, exam: Math.round(num * 0.6), total: num, grade: calc.grade, remark: calc.remark });
+            parsedSubjects.push({
+              subject: subName,
+              ca1: Math.round(num * 0.2),
+              ca2: Math.round(num * 0.2),
+              ca3: 0,
+              exam: Math.round(num * 0.6),
+              total: num,
+              grade: calc.grade,
+              remark: calc.remark,
+              hasCa1: true,
+              hasCa2: true,
+              hasCa3: false,
+              hasExam: true,
+            });
           }
         }
       }
 
       if (matched) {
-        // Update existing student in-place without creating a duplicate row
-        const existingGrades: GradeRecord[] = Array.isArray(matched.grades) ? [...matched.grades] : [];
+        // Update existing student in-place without creating a duplicate row, stripping any seeded demo subjects first
+        const existingGrades: GradeRecord[] = Array.isArray(matched.grades)
+          ? matched.grades.filter(g => g && g.subject && !isSeededDemoGrade(g))
+          : [];
         for (const sub of parsedSubjects) {
           const idx = existingGrades.findIndex(g => g.subject?.trim().toLowerCase() === sub.subject.trim().toLowerCase());
           if (idx >= 0) {
+            const currentCa1 = Number(existingGrades[idx].ca1 || 0);
+            const currentCa2 = Number(existingGrades[idx].ca2 || 0);
             const currentExam = Number(existingGrades[idx].exam || 0);
             const currentCa3 = Number(existingGrades[idx].ca3 || 0);
-            // In tests_only mode, preserve existing terminal exam unless new exam is explicitly provided
-            const finalExam = (isTestsOnly && (!sub.exam || sub.exam === 0)) ? currentExam : sub.exam;
-            const finalCa3 = (isTestsOnly && (!sub.ca3 || sub.ca3 === 0)) ? currentCa3 : sub.ca3;
-            const computedTotal = sub.ca1 + sub.ca2 + finalCa3 + finalExam;
+
+            const finalCa1 = sub.hasCa1 === false ? currentCa1 : sub.ca1;
+            const finalCa2 = sub.hasCa2 === false ? currentCa2 : sub.ca2;
+            const finalCa3 = sub.hasCa3 === false || (isTestsOnly && (!sub.ca3 || sub.ca3 === 0)) ? currentCa3 : sub.ca3;
+            const finalExam = sub.hasExam === false || (isTestsOnly && (!sub.exam || sub.exam === 0)) ? currentExam : sub.exam;
+            const computedTotal = finalCa1 + finalCa2 + finalCa3 + finalExam;
             const calc = calculateGrade(computedTotal);
 
             existingGrades[idx] = {
               ...existingGrades[idx],
               subject: existingGrades[idx].subject || sub.subject,
-              ca1: sub.ca1,
-              ca2: sub.ca2,
+              ca1: finalCa1,
+              ca2: finalCa2,
               ca3: finalCa3,
               exam: finalExam,
               total: computedTotal,
               grade: isTestsOnly ? calc.grade : (sub.grade || calc.grade),
               remark: isTestsOnly ? calc.remark : (sub.remark || calc.remark),
+              isRealScore: true,
               ...(targetTerm === '1st Term' ? { term1Total: computedTotal } : {}),
               ...(targetTerm === '2nd Term' ? { term2Total: computedTotal } : {}),
               ...(targetTerm === '3rd Term' ? { term3Total: computedTotal } : {})
-            };
+            } as GradeRecord;
           } else {
             existingGrades.push({
               id: `grd-${matched.id}-${sub.subject.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
@@ -3832,10 +3984,11 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
               grade: sub.grade,
               remark: sub.remark,
               annualAverage: sub.total,
+              isRealScore: true,
               ...(targetTerm === '1st Term' ? { term1Total: sub.total } : {}),
               ...(targetTerm === '2nd Term' ? { term2Total: sub.total } : {}),
               ...(targetTerm === '3rd Term' ? { term3Total: sub.total } : {})
-            });
+            } as GradeRecord);
           }
         }
         const termAvg = existingGrades.length > 0
@@ -3843,14 +3996,16 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           : 0;
 
         const updatedPassword = (rec.password && String(rec.password).trim()) ? String(rec.password).trim() : matched.password;
+        const resolvedName = rawName && !rawName.startsWith('Student ') ? rawName : matched.name;
         const updatedStudent: StudentProfile = {
           ...matched,
-          name: rawName || matched.name,
+          name: resolvedName,
           grade: rec.grade_level || rec.grade || rec.class || matched.grade,
           password: updatedPassword,
           parentName: rec.parent_name || rec.parentName || matched.parentName,
           parentPhone: rec.parent_phone || rec.parentPhone || matched.parentPhone,
           grades: existingGrades,
+          hasUploadedResults: true,
           termAverage: termAvg,
           cumulativeAnnualAverage: termAvg,
           updatedAt: timestamp,
@@ -3869,13 +4024,16 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           }
         } as StudentProfile;
 
-        if (rec.password && String(rec.password).trim() && String(rec.password).trim() !== matched.password) {
+        if (
+          (rec.password && String(rec.password).trim() && String(rec.password).trim() !== matched.password) ||
+          (rawName && rawName !== matched.name)
+        ) {
           void remoteCreateCredential(
             matched.regNumber,
-            String(rec.password).trim(),
+            updatedPassword || 'stanbax2025',
             'student',
             matched.id,
-            [updatedStudent.email, updatedStudent.name.toLowerCase()]
+            [updatedStudent.email, updatedStudent.name.toLowerCase()].filter((x): x is string => Boolean(x))
           );
         }
 
@@ -3928,10 +4086,11 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           grade: sub.grade,
           remark: sub.remark,
           annualAverage: sub.total,
+          isRealScore: true,
           ...(targetTerm === '1st Term' ? { term1Total: sub.total } : {}),
           ...(targetTerm === '2nd Term' ? { term2Total: sub.total } : {}),
           ...(targetTerm === '3rd Term' ? { term3Total: sub.total } : {})
-        }));
+        } as GradeRecord));
 
         const termAvg = formattedGrades.length > 0
           ? Math.round((formattedGrades.reduce((sum, g) => sum + (g.total || 0), 0) / formattedGrades.length) * 10) / 10
@@ -3949,6 +4108,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           email: studentEmail,
           password: customPass,
           attendancePercent: 95,
+          hasUploadedResults: true,
           termAverage: termAvg,
           cumulativeAnnualAverage: termAvg,
           updatedAt: timestamp,
@@ -5452,6 +5612,13 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
               localStorage.setItem('stanbax_student_id', res.refId);
               sessionStorage.setItem('stanbax_student_id', res.refId);
             }
+            if (matchedStudent?.regNumber) {
+              localStorage.setItem('stanbax_student_reg', matchedStudent.regNumber);
+              sessionStorage.setItem('stanbax_student_reg', matchedStudent.regNumber);
+            } else {
+              localStorage.setItem('stanbax_student_reg', cleanId);
+              sessionStorage.setItem('stanbax_student_reg', cleanId);
+            }
             localStorage.setItem('stanbax_student_auth', 'true');
             sessionStorage.setItem('stanbax_student_auth', 'true');
             localStorage.setItem('stanbax_active_section', 'student-portal');
@@ -5471,7 +5638,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             break;
         }
         // Hydrate + reload into the portal (never returns in practice).
-        await completeRemoteLogin(res.token!, sectionByRole[role]);
+        await completeRemoteLogin(res.token!, sectionByRole[role], res.refId, cleanId);
         return {
           success: true,
           role,
@@ -5544,15 +5711,25 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             setIsStudentAuthenticated(true);
             const stuUser = sData.user;
             if (stuUser?.id) {
-              setActiveStudentId(stuUser.id);
-              localStorage.setItem('stanbax_student_id', stuUser.id);
-              sessionStorage.setItem('stanbax_student_id', stuUser.id);
-              try { sessionStorage.setItem('stanbax_active_student_cache', JSON.stringify(stuUser)); } catch {}
               setStudents(prev => {
-                const exists = prev.some(s => s.id === stuUser.id);
-                const next = exists ? prev.map(s => s.id === stuUser.id ? { ...s, ...stuUser } : s) : [stuUser, ...prev];
-                try { localStorage.setItem('stanbax_students', JSON.stringify(next)); } catch {}
-                return next;
+                // Merge server stuUser with existing state using deduplicateStudentsByRegistration so newer cloud/local edits win
+                const deduplicated = deduplicateStudentsByRegistration([stuUser, ...prev]);
+                const resolvedStu =
+                  deduplicated.find(
+                    s =>
+                      s.id === stuUser.id ||
+                      (stuUser.regNumber && normalizeRegForUpsert(s.regNumber) === normalizeRegForUpsert(stuUser.regNumber))
+                  ) || stuUser;
+                setActiveStudentId(resolvedStu.id);
+                localStorage.setItem('stanbax_student_id', resolvedStu.id);
+                sessionStorage.setItem('stanbax_student_id', resolvedStu.id);
+                if (resolvedStu.regNumber) {
+                  localStorage.setItem('stanbax_student_reg', resolvedStu.regNumber);
+                  sessionStorage.setItem('stanbax_student_reg', resolvedStu.regNumber);
+                }
+                try { sessionStorage.setItem('stanbax_active_student_cache', JSON.stringify(resolvedStu)); } catch {}
+                setLocalStorageSilent('stanbax_students', JSON.stringify(deduplicated));
+                return deduplicated;
               });
             }
             localStorage.setItem('stanbax_student_auth', 'true');
@@ -6287,9 +6464,16 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         localStorage.setItem('stanbax_student_id', sid);
         sessionStorage.setItem('stanbax_student_auth', 'true');
         sessionStorage.setItem('stanbax_student_id', sid);
+        if (studentToVerify?.regNumber) {
+          localStorage.setItem('stanbax_student_reg', studentToVerify.regNumber);
+          sessionStorage.setItem('stanbax_student_reg', studentToVerify.regNumber);
+        } else {
+          localStorage.setItem('stanbax_student_reg', identifier.trim());
+          sessionStorage.setItem('stanbax_student_reg', identifier.trim());
+        }
         localStorage.setItem('stanbax_active_section', 'student-portal');
         sessionStorage.setItem('stanbax_active_section', 'student-portal');
-        await completeRemoteLogin(res.token!, 'student-portal');
+        await completeRemoteLogin(res.token!, 'student-portal', res.refId, identifier.trim());
         return { success: true, student: remoteStudent || matchedStudent };
       }
     }
@@ -6305,8 +6489,12 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         if (sRes.ok) {
           const sData = await sRes.json();
           if (sData.success && sData.role === 'student' && sData.user) {
-            const onlineStudent: StudentProfile = sData.user;
-            setStudents(prev => [onlineStudent, ...prev.filter(s => s.id !== onlineStudent.id)]);
+            const onlineStudent: StudentProfile = stripDemoGradesFromStudent(sData.user);
+            setStudents(prev => {
+              const deduplicated = deduplicateStudentsByRegistration([onlineStudent, ...prev]);
+              setLocalStorageSilent('stanbax_students', JSON.stringify(deduplicated));
+              return deduplicated;
+            });
             clearOtherRoles('student');
             setIsStudentAuthenticated(true);
             setActiveStudentId(onlineStudent.id);
@@ -6314,6 +6502,10 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             localStorage.setItem('stanbax_student_id', onlineStudent.id);
             sessionStorage.setItem('stanbax_student_auth', 'true');
             sessionStorage.setItem('stanbax_student_id', onlineStudent.id);
+            if (onlineStudent.regNumber) {
+              localStorage.setItem('stanbax_student_reg', onlineStudent.regNumber);
+              sessionStorage.setItem('stanbax_student_reg', onlineStudent.regNumber);
+            }
             localStorage.setItem('stanbax_active_section', 'student-portal');
             sessionStorage.setItem('stanbax_active_section', 'student-portal');
             setActiveSection('student-portal');
@@ -6357,6 +6549,10 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     localStorage.setItem('stanbax_student_id', matchedStudent.id);
     sessionStorage.setItem('stanbax_student_auth', 'true');
     sessionStorage.setItem('stanbax_student_id', matchedStudent.id);
+    if (matchedStudent.regNumber) {
+      localStorage.setItem('stanbax_student_reg', matchedStudent.regNumber);
+      sessionStorage.setItem('stanbax_student_reg', matchedStudent.regNumber);
+    }
     localStorage.setItem('stanbax_active_section', 'student-portal');
     sessionStorage.setItem('stanbax_active_section', 'student-portal');
     return { success: true, student: matchedStudent };
@@ -11259,7 +11455,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
               }
               if (!changed) return prev;
               const combined = Array.from(map.values());
-              try { localStorage.setItem('stanbax_chat_channels', JSON.stringify(combined)); } catch {}
+              setLocalStorageSilent('stanbax_chat_channels', JSON.stringify(combined));
               return combined;
             });
           }
@@ -11279,7 +11475,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
               const combined = Array.from(map.values()).sort(
                 (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
               );
-              try { localStorage.setItem('stanbax_chat_messages', JSON.stringify(combined)); } catch {}
+              setLocalStorageSilent('stanbax_chat_messages', JSON.stringify(combined));
               return combined;
             });
           }
@@ -11299,7 +11495,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
                 });
                 if (!added) return prev;
                 const merged = Array.from(seen.values());
-                try { localStorage.setItem('stanbax_subjects', JSON.stringify(merged)); } catch {}
+                setLocalStorageSilent('stanbax_subjects', JSON.stringify(merged));
                 return merged;
               });
             }
@@ -11341,7 +11537,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
                 const combined = deduplicateStudentsByRegistration([...remoteValid, ...prevFiltered]);
                 if (JSON.stringify(combined) === JSON.stringify(prev)) return prev;
-                try { localStorage.setItem('stanbax_students', JSON.stringify(combined)); } catch {}
+                setLocalStorageSilent('stanbax_students', JSON.stringify(combined));
                 return combined;
               });
             }
@@ -11363,7 +11559,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
                   remoteCfg.activeSession !== prev.activeSession;
                 if (!isDiff) return prev;
                 const updated = { ...prev, ...remoteCfg };
-                try { localStorage.setItem('stanbax_assessment_config', JSON.stringify(updated)); } catch {}
+                setLocalStorageSilent('stanbax_assessment_config', JSON.stringify(updated));
                 return updated;
               });
             }
@@ -11387,7 +11583,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
               }
               if (!changed && map.size === prev.length) return prev;
               const combined = Array.from(map.values());
-              try { localStorage.setItem('stanbax_tutors', JSON.stringify(combined)); } catch {}
+              setLocalStorageSilent('stanbax_tutors', JSON.stringify(combined));
               return combined;
             });
           }
@@ -11410,7 +11606,7 @@ export const SchoolProvider: React.FC<{ children: React.ReactNode }> = ({ childr
               }
               if (!changed && map.size === prev.length) return prev;
               const combined = Array.from(map.values());
-              try { localStorage.setItem('stanbax_parents_list', JSON.stringify(combined)); } catch {}
+              setLocalStorageSilent('stanbax_parents_list', JSON.stringify(combined));
               return combined;
             });
           }

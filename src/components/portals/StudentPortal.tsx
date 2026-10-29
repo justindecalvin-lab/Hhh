@@ -285,10 +285,10 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
   const hwStatusFor = (hw: Homework) => hw.submissions?.[student.id] ?? hw.status;
   const pendingHwCount = myHomeworks.filter(h => hwStatusFor(h) === 'Pending').length;
 
-  // Resiliently resolve student's full historical academic records
-  const studentHistory = (student.academicHistory && student.academicHistory.length > 0)
+  // Resiliently resolve student's historical academic records (only real saved history)
+  const studentHistory = Array.isArray(student.academicHistory) && student.academicHistory.length > 0
     ? student.academicHistory
-    : generateStudentHistoricalRecords(student);
+    : [];
 
   // Complete available session list across active session and student past records
   const sessionList = Array.from(new Set([
@@ -297,15 +297,16 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
     ...(availableSessions || [])
   ])).filter(Boolean);
 
-  const isCurrentSession = selectedSession === assessmentConfig.activeSession;
+  const normalizeSess = (s?: string) => String(s || '').replace(/\s*academic\s*session/i, '').trim().toLowerCase();
+  const isCurrentSession = !selectedSession || normalizeSess(selectedSession) === normalizeSess(assessmentConfig.activeSession);
   const currentTermKey: '1st Term' | '2nd Term' | '3rd Term' = 
     reportTerm.includes('1st') ? '1st Term' : 
     reportTerm.includes('2nd') ? '2nd Term' : '3rd Term';
   const is3rdTerm = currentTermKey === '3rd Term';
 
-  // Historical session data if user selected a past session
-  const historicalSession = !isCurrentSession 
-    ? (studentHistory.find(h => h.sessionName === selectedSession) || studentHistory[0])
+  // Historical session data if user explicitly selected a past session that exists in academicHistory
+  const historicalSession = !isCurrentSession && studentHistory.length > 0
+    ? studentHistory.find(h => normalizeSess(h.sessionName) === normalizeSess(selectedSession))
     : undefined;
 
   const historicalTermRecord = historicalSession?.terms?.[currentTermKey];
@@ -313,70 +314,69 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
   // Dynamic values tailored to the selected session & term
   const displayClass = historicalSession ? historicalSession.classEnrolled : student.grade;
 
-  // Preserve actual CA1, CA2, CA3, and Exam scores when viewing the active term or published collated results;
-  // only project onto a synthetic scale when viewing a historical term total that has no itemized CA/Exam breakdown.
+  // Preserve actual CA1, CA2, CA3, and Exam scores when viewing the active term or published collated results
   const projectToTermScale = (g: GradeRecord, termKey: '1st Term' | '2nd Term' | '3rd Term'): GradeRecord => {
-    const isViewingActiveTerm = isCurrentSession && termKey === ((schoolInfo.activeTerm as any) || '1st Term');
-    const hasActualBreakdown = (Number(g.ca1 || 0) + Number(g.ca2 || 0) + Number(g.ca3 || 0) + Number(g.exam || 0)) > 0;
-
-    if (isViewingActiveTerm || hasActualBreakdown) {
-      const ca1 = Number(g.ca1 || 0);
-      const ca2 = Number(g.ca2 || 0);
-      const ca3 = Number(g.ca3 || 0);
-      const exam = Number(g.exam || 0);
-      const tot = (ca1 + ca2 + ca3 + exam) || Number(
-        termKey === '1st Term'
-          ? (g.term1Total ?? g.total)
-          : termKey === '2nd Term'
-          ? (g.term2Total ?? g.total)
-          : (g.term3Total ?? g.total)
-      ) || 0;
-      const { grade, remark } = calculateGrade(tot);
-      return {
-        ...g,
-        ca1,
-        ca2,
-        ca3,
-        exam,
-        total: tot,
-        grade: g.grade || grade,
-        remark: g.remark || remark,
-      };
-    }
-
-    const tot = termKey === '1st Term'
-      ? (g.term1Total ?? g.total)
-      : termKey === '2nd Term'
-      ? (g.term2Total ?? g.total)
-      : (g.term3Total ?? g.total);
-    const caEach = Math.min(10, Math.max(0, Math.round(tot * 0.1)));
-    const exam = Math.max(0, tot - caEach * 3);
+    const ca1 = Number(g.ca1 ?? 0);
+    const ca2 = Number(g.ca2 ?? 0);
+    const ca3 = Number(g.ca3 ?? 0);
+    const exam = Number(g.exam ?? 0);
+    const tot = (ca1 + ca2 + ca3 + exam) || Number(
+      termKey === '1st Term'
+        ? (g.term1Total ?? g.total)
+        : termKey === '2nd Term'
+        ? (g.term2Total ?? g.total)
+        : (g.term3Total ?? g.total)
+    ) || 0;
     const { grade, remark } = calculateGrade(tot);
-    return { ...g, ca1: caEach, ca2: caEach, ca3: caEach, exam, total: tot, grade, remark };
+    return {
+      ...g,
+      ca1,
+      ca2,
+      ca3,
+      exam,
+      total: tot,
+      grade: g.grade || grade,
+      remark: g.remark || remark,
+    };
   };
+
+  const isNotDemoGrade = (g: any): boolean => {
+    if (!g || typeof g !== 'object') return false;
+    if (g.isRealScore) return true;
+    const id = String(g.id || '');
+    if (/^(j?grd-\d+|grd-stu-\d+-\d+)$/.test(id) && g.color === '#16a34a') {
+      return false;
+    }
+    return true;
+  };
+
+  const collatedGradesList = Array.isArray(student.lastCollatedResult?.grades)
+    ? student.lastCollatedResult!.grades.filter(isNotDemoGrade)
+    : [];
+  const rawGradesList = Array.isArray(grades) ? grades.filter(isNotDemoGrade) : [];
 
   const activeSourceGrades: GradeRecord[] =
     isCurrentSession &&
-    student.lastCollatedResult &&
-    Array.isArray(student.lastCollatedResult.grades) &&
-    student.lastCollatedResult.grades.length > 0 &&
-    (!student.lastCollatedResult.term || student.lastCollatedResult.term === currentTermKey)
-      ? student.lastCollatedResult.grades
-      : grades;
+    collatedGradesList.length > 0 &&
+    (!student.lastCollatedResult?.term || student.lastCollatedResult.term === currentTermKey)
+      ? collatedGradesList
+      : rawGradesList;
 
   const displayGrades: GradeRecord[] = historicalTermRecord
     ? historicalTermRecord.grades
     : activeSourceGrades.map(g => projectToTermScale(g, currentTermKey));
 
+  const computedActiveAverage = displayGrades.length > 0
+    ? Math.round((displayGrades.reduce((sum, g) => sum + Number(g.total || 0), 0) / displayGrades.length) * 10) / 10
+    : 0;
+
   const displayTermAverage = historicalTermRecord
     ? historicalTermRecord.termAverage
-    : (isCurrentSession && student.lastCollatedResult?.termAverage && (!student.lastCollatedResult.term || student.lastCollatedResult.term === currentTermKey)
-        ? student.lastCollatedResult.termAverage
-        : currentTermKey === '1st Term'
-        ? (student.term1Average ?? student.termAverage)
-        : currentTermKey === '2nd Term'
-        ? (student.term2Average ?? student.termAverage)
-        : (student.term3Average ?? student.termAverage));
+    : (computedActiveAverage > 0
+        ? computedActiveAverage
+        : (isCurrentSession && student.lastCollatedResult?.termAverage && (!student.lastCollatedResult.term || student.lastCollatedResult.term === currentTermKey)
+            ? student.lastCollatedResult.termAverage
+            : 0));
 
   const displayAttendance = historicalTermRecord
     ? `${historicalTermRecord.attendanceDays} / ${historicalTermRecord.totalSchoolDays} Days (${Math.round((historicalTermRecord.attendanceDays / historicalTermRecord.totalSchoolDays) * 100)}%)`
@@ -571,8 +571,8 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
     <tbody>
       ${reportGrades.map(g => {
         const gInfo = calculateGrade(g.total);
-        const t1 = g.term1Total ?? Math.max(70, g.total - 3);
-        const t2 = g.term2Total ?? Math.max(72, g.total + 2);
+        const t1 = g.term1Total ?? g.total;
+        const t2 = g.term2Total ?? g.total;
         const t3 = g.term3Total ?? g.total;
         const ann = g.annualAverage ?? Math.round((t1 + t2 + t3) / 3);
         const isClassCgpa = isCgpaActiveForClass(displayClass);
@@ -580,10 +580,10 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
         const gpVal = ((gInfo.gradePoint ?? 0) * (scaleVal === 4.0 ? 0.8 : 1.0)).toFixed(2);
         return `<tr>
           <td class="sub-col">${g.subject}</td>
-          <td>${g.ca1}</td>
-          <td>${g.ca2}</td>
-          ${isMidSheet ? '' : `<td>${g.ca3 ?? 8}</td>
-          <td>${g.exam}</td>`}
+          <td>${g.ca1 ?? 0}</td>
+          <td>${g.ca2 ?? 0}</td>
+          ${isMidSheet ? '' : `<td>${g.ca3 ?? 0}</td>
+          <td>${g.exam ?? 0}</td>`}
           <td style="font-weight: 800; color: #1e3a8a;">${isMidSheet ? `${(g.ca1 ?? 0) + (g.ca2 ?? 0)}/20 (${g.total}%)` : `${g.total}%`}</td>
           <td><span class="grade-badge">${g.grade || gInfo.grade}</span></td>
           ${isClassCgpa ? `<td style="font-weight: 900; color: #1e3a8a; background: #f0fdf4;">${gpVal}</td>` : ''}
@@ -864,15 +864,15 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <span className="font-black text-sm sm:text-base md:text-lg tracking-tight truncate">
-                  STANBAX SCHOLAR PORTAL
+                <span className="font-black text-sm sm:text-base md:text-lg tracking-tight truncate text-white">
+                  {student.name}
                 </span>
-                <span className="hidden xs:inline-flex px-2 py-0.5 rounded-full bg-blue-500/30 text-amber-300 text-[10px] font-extrabold uppercase tracking-wide border border-amber-400/30 shrink-0">
+                <span className="inline-flex px-2 py-0.5 rounded-full bg-blue-500/30 text-amber-300 text-[10px] font-extrabold uppercase tracking-wide border border-amber-400/30 shrink-0">
                   {student.grade}
                 </span>
               </div>
-              <p className="text-xs text-blue-200 truncate hidden sm:block">
-                Logged in as <strong>{student.name}</strong> • Reg: <span className="font-mono text-amber-300">{student.regNumber}</span>
+              <p className="text-[11px] sm:text-xs text-blue-200 truncate">
+                Reg: <span className="font-mono text-amber-300 font-bold">{student.regNumber}</span> • <span className="text-blue-300">Scholar Portal</span>
               </p>
             </div>
           </div>
@@ -2786,8 +2786,8 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
                     <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
                       {reportGrades.map((g, idx) => {
                         const gradeInfo = calculateGrade(g.total);
-                        const t1 = g.term1Total ?? Math.max(70, g.total - 3);
-                        const t2 = g.term2Total ?? Math.max(72, g.total + 2);
+                        const t1 = g.term1Total ?? g.total;
+                        const t2 = g.term2Total ?? g.total;
                         const t3 = g.term3Total ?? g.total;
                         const annualAvg = g.annualAverage ?? Math.round((t1 + t2 + t3) / 3);
                         const isClassCgpa = isCgpaActiveForClass(displayClass);
@@ -2797,12 +2797,12 @@ export const StudentPortal: React.FC<StudentPortalProps> = ({ onBackToWebsite })
                         return (
                           <tr key={idx} className="hover:bg-blue-50/50 transition-colors">
                             <td className="py-3 px-4 sm:px-6 font-black text-slate-900">{g.subject}</td>
-                            <td className="py-3 px-3 text-center text-slate-700 font-semibold">{g.ca1}</td>
-                            <td className="py-3 px-3 text-center text-slate-700 font-semibold">{g.ca2}</td>
+                            <td className="py-3 px-3 text-center text-slate-700 font-semibold">{g.ca1 ?? 0}</td>
+                            <td className="py-3 px-3 text-center text-slate-700 font-semibold">{g.ca2 ?? 0}</td>
                             {!isMidSheet && (
                               <>
-                                <td className="py-3 px-3 text-center text-slate-700 font-semibold">{g.ca3 ?? 8}</td>
-                                <td className="py-3 px-3 text-center text-slate-700 font-semibold">{g.exam}</td>
+                                <td className="py-3 px-3 text-center text-slate-700 font-semibold">{g.ca3 ?? 0}</td>
+                                <td className="py-3 px-3 text-center text-slate-700 font-semibold">{g.exam ?? 0}</td>
                               </>
                             )}
                             <td className="py-3 px-3 text-center font-black text-blue-950">

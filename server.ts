@@ -1337,41 +1337,93 @@ async function startServer() {
     return padded.replace(/[^a-z0-9]/g, "");
   }
 
+  function isServerDemoGrade(g: any): boolean {
+    if (!g) return false;
+    if (g.isRealScore === true) return false;
+    const id = String(g.id || "").trim();
+    if (/^(j?grd-\d+|grd-stu-\d+-\d+|grd-.*-h\d-\d+)$/i.test(id)) return true;
+    if (g.color === "#16a34a") return true;
+    return false;
+  }
+
+  function stripServerDemoGrades(stu: any): any {
+    if (!stu || typeof stu !== "object") return stu;
+    const rawGrades = Array.isArray(stu.grades) ? stu.grades : [];
+    const cleanGrades = rawGrades.filter((g: any) => g && g.subject && !isServerDemoGrade(g));
+    const hadDemo = cleanGrades.length !== rawGrades.length;
+    if (!hadDemo) return stu;
+    const avg =
+      cleanGrades.length > 0
+        ? Math.round((cleanGrades.reduce((sum: number, item: any) => sum + (Number(item.total) || 0), 0) / cleanGrades.length) * 10) / 10
+        : 0;
+    return {
+      ...stu,
+      grades: cleanGrades,
+      termAverage: avg,
+      ...(cleanGrades.length === 0 ? { term1Average: 0, cumulativeAnnualAverage: 0 } : {})
+    };
+  }
+
   function deduplicateServerStudents(list: any[], deletedSet: Set<string>): any[] {
     if (!Array.isArray(list)) return [];
     const byReg = new Map<string, any>();
     const byId = new Map<string, any>();
     const result: any[] = [];
 
-    const mergeTwoStudents = (existing: any, incoming: any) => {
+    const getTs = (rec: any): number => {
+      const t1 = rec?.updatedAt ? new Date(rec.updatedAt).getTime() : 0;
+      const t2 = rec?.lastCollatedResult?.dispatchedAt
+        ? new Date(rec.lastCollatedResult.dispatchedAt).getTime()
+        : 0;
+      return Math.max(Number.isFinite(t1) ? t1 : 0, Number.isFinite(t2) ? t2 : 0);
+    };
+
+    const mergeTwoStudents = (rawExisting: any, rawIncoming: any) => {
+      const existing = stripServerDemoGrades(rawExisting);
+      const incoming = stripServerDemoGrades(rawIncoming);
+
       const preferExistingId =
         existing.id &&
         (!String(existing.id).startsWith("std-batch-") || String(incoming.id || "").startsWith("std-batch-"));
       const canonicalId = preferExistingId ? existing.id : (incoming.id || existing.id);
       const canonicalReg = existing.regNumber || incoming.regNumber;
 
-      const gradeMap = new Map<string, any>();
-      const existingGrades = Array.isArray(existing.grades) ? existing.grades : [];
-      const incomingGrades = Array.isArray(incoming.grades) ? incoming.grades : [];
+      const existingTs = getTs(existing);
+      const incomingTs = getTs(incoming);
+      const incomingIsNewer = incomingTs >= existingTs;
 
-      for (const g of existingGrades) {
-        if (g && g.subject) gradeMap.set(String(g.subject).toLowerCase().trim(), { ...g });
+      const primary = incomingIsNewer ? incoming : existing;
+      const secondary = incomingIsNewer ? existing : incoming;
+
+      const primaryGrades = Array.isArray(primary.grades) ? primary.grades : [];
+      const secondaryGrades = Array.isArray(secondary.grades) ? secondary.grades : [];
+      const primaryHasReal =
+        Boolean(primary.hasUploadedResults) ||
+        primaryGrades.some((g: any) => g?.isRealScore === true) ||
+        incomingTs > 0 ||
+        existingTs > 0;
+
+      const gradeMap = new Map<string, any>();
+      for (const g of secondaryGrades) {
+        if (g && g.subject && !isServerDemoGrade(g) && (!primaryHasReal || g.isRealScore === true)) {
+          gradeMap.set(String(g.subject).toLowerCase().trim(), { ...g });
+        }
       }
-      for (const g of incomingGrades) {
-        if (g && g.subject) {
+      for (const g of primaryGrades) {
+        if (g && g.subject && !isServerDemoGrade(g)) {
           const k = String(g.subject).toLowerCase().trim();
           const prev = gradeMap.get(k);
           if (prev) {
             const ca1 = g.ca1 !== undefined && g.ca1 !== null ? Number(g.ca1) : Number(prev.ca1 || 0);
             const ca2 = g.ca2 !== undefined && g.ca2 !== null ? Number(g.ca2) : Number(prev.ca2 || 0);
-            const ca3 = g.ca3 !== undefined && g.ca3 !== null && Number(g.ca3) > 0 ? Number(g.ca3) : Number(prev.ca3 || 0);
-            const exam = g.exam !== undefined && g.exam !== null && Number(g.exam) > 0 ? Number(g.exam) : Number(prev.exam || 0);
+            const ca3 = g.ca3 !== undefined && g.ca3 !== null ? Number(g.ca3) : Number(prev.ca3 || 0);
+            const exam = g.exam !== undefined && g.exam !== null ? Number(g.exam) : Number(prev.exam || 0);
             const total = (ca1 + ca2 + ca3 + exam) || Number(g.total || prev.total || 0);
             gradeMap.set(k, {
               ...prev,
               ...g,
-              id: prev.id || g.id,
-              subject: prev.subject || g.subject,
+              id: g.id || prev.id,
+              subject: g.subject || prev.subject,
               ca1,
               ca2,
               ca3,
@@ -1388,21 +1440,31 @@ async function startServer() {
       const termAverage =
         mergedGrades.length > 0
           ? Math.round((mergedGrades.reduce((sum, item) => sum + (Number(item.total) || 0), 0) / mergedGrades.length) * 10) / 10
-          : Number(incoming.termAverage ?? existing.termAverage ?? 0);
+          : 0;
+
+      const resolvedName =
+        primary.name && !String(primary.name).startsWith("Student ")
+          ? primary.name
+          : secondary.name && !String(secondary.name).startsWith("Student ")
+          ? secondary.name
+          : primary.name || secondary.name;
 
       return {
-        ...existing,
-        ...incoming,
+        ...secondary,
+        ...primary,
         id: canonicalId,
         regNumber: canonicalReg,
-        name: incoming.name && !String(incoming.name).startsWith("Student ") ? incoming.name : (existing.name || incoming.name),
+        name: resolvedName,
         grades: mergedGrades,
-        termAverage
+        termAverage,
+        hasUploadedResults: Boolean(primary.hasUploadedResults || secondary.hasUploadedResults || mergedGrades.some((g: any) => g?.isRealScore)),
+        updatedAt: primary.updatedAt || secondary.updatedAt
       };
     };
 
-    for (const s of list) {
-      if (!s || (!s.id && !s.regNumber)) continue;
+    for (const rawS of list) {
+      if (!rawS || (!rawS.id && !rawS.regNumber)) continue;
+      const s = stripServerDemoGrades(rawS);
       const idLower = String(s.id || "").toLowerCase().trim();
       const regSpaceClean = String(s.regNumber || "").toLowerCase().replace(/\s+/g, "");
       const regNorm = normalizeServerReg(s.regNumber);
@@ -2543,8 +2605,10 @@ async function startServer() {
         }
 
         if (matched) {
-          // Update existing student in-place without creating any new row
-          const existingGrades: any[] = Array.isArray(matched.grades) ? [...matched.grades] : [];
+          // Update existing student in-place without creating any new row, stripping any seeded demo grades first
+          const existingGrades: any[] = Array.isArray(matched.grades)
+            ? matched.grades.filter((g: any) => g && g.subject && !isServerDemoGrade(g))
+            : [];
           for (const s of rowSubjects) {
             const idx = existingGrades.findIndex(g => g.subject?.toLowerCase().trim() === s.subject.toLowerCase().trim());
             if (idx >= 0) {
@@ -2554,8 +2618,8 @@ async function startServer() {
               const currentCa3 = Number(existingGrades[idx].ca3 || 0);
               const finalCa1 = s.hasCa1 === false ? currentCa1 : s.ca1;
               const finalCa2 = s.hasCa2 === false ? currentCa2 : s.ca2;
-              const finalExam = (isTestsOnly && (!s.exam || s.exam === 0)) ? currentExam : s.exam;
-              const finalCa3 = (isTestsOnly && (!s.ca3 || s.ca3 === 0)) ? currentCa3 : s.ca3;
+              const finalExam = s.hasExam === false || (isTestsOnly && (!s.exam || s.exam === 0)) ? currentExam : s.exam;
+              const finalCa3 = s.hasCa3 === false || (isTestsOnly && (!s.ca3 || s.ca3 === 0)) ? currentCa3 : s.ca3;
               const finalTotal = finalCa1 + finalCa2 + finalCa3 + finalExam;
               const { grade, remark } = computeGrade(finalTotal);
 
@@ -2569,6 +2633,7 @@ async function startServer() {
                 total: finalTotal,
                 grade: isTestsOnly ? grade : (s.grade || grade),
                 remark: isTestsOnly ? remark : (s.remark || remark),
+                isRealScore: true,
                 ...(targetTerm === '1st Term' ? { term1Total: finalTotal } : {}),
                 ...(targetTerm === '2nd Term' ? { term2Total: finalTotal } : {}),
                 ...(targetTerm === '3rd Term' ? { term3Total: finalTotal } : {})
@@ -2584,6 +2649,7 @@ async function startServer() {
                 total: s.total,
                 grade: s.grade,
                 remark: s.remark,
+                isRealScore: true,
                 ...(targetTerm === '1st Term' ? { term1Total: s.total } : {}),
                 ...(targetTerm === '2nd Term' ? { term2Total: s.total } : {}),
                 ...(targetTerm === '3rd Term' ? { term3Total: s.total } : {})
@@ -2594,19 +2660,26 @@ async function startServer() {
             ? Math.round((existingGrades.reduce((sum, g) => sum + (g.total || 0), 0) / existingGrades.length) * 10) / 10
             : 0;
 
-          if (rawName && (!matched.name || matched.name.startsWith('Student '))) matched.name = rawName;
+          if (rawName && !rawName.startsWith('Student ')) matched.name = rawName;
           if (rec.grade_level || rec.grade || rec.class) matched.grade = rec.grade_level || rec.grade || rec.class;
           matched.grades = existingGrades;
+          matched.hasUploadedResults = true;
+          matched.updatedAt = timestamp;
           matched.termAverage = termAvg;
           if (targetTerm === '1st Term') matched.term1Average = termAvg;
           if (targetTerm === '2nd Term') matched.term2Average = termAvg;
           if (targetTerm === '3rd Term') matched.term3Average = termAvg;
           matched.lastCollatedResult = {
+            session: targetSession,
             academicSession: targetSession,
             term: targetTerm,
+            reportKind: 'end',
             termAverage: termAvg,
+            annualAverage: termAvg,
             subjectsCount: existingGrades.length,
+            grades: existingGrades,
             dispatchedAt: timestamp,
+            dispatchedBy: 'Admin Batch Collation Desk',
             status: 'Collated via Batch Upload'
           };
           registerStudentInMaps(matched);
@@ -2637,6 +2710,7 @@ async function startServer() {
             total: s.total,
             grade: s.grade,
             remark: s.remark,
+            isRealScore: true,
             ...(targetTerm === '1st Term' ? { term1Total: s.total } : {}),
             ...(targetTerm === '2nd Term' ? { term2Total: s.total } : {}),
             ...(targetTerm === '3rd Term' ? { term3Total: s.total } : {})
@@ -3047,21 +3121,33 @@ async function startServer() {
       const studentId = req.params.id;
       const updates = req.body || {};
       const existingStudents = getOnlineStudents();
-      const index = existingStudents.findIndex(s => s.id === studentId);
+      const targetNormReg = normalizeServerReg(updates.regNumber || studentId);
+      const index = existingStudents.findIndex(
+        s =>
+          s.id === studentId ||
+          (targetNormReg && normalizeServerReg(s.regNumber) === targetNormReg)
+      );
 
+      let updatedStudent: any;
       if (index === -1) {
-        return res.status(404).json({ success: false, error: "Scholar account not found online." });
+        updatedStudent = stripServerDemoGrades({
+          ...updates,
+          id: updates.id || studentId,
+          savedOnline: true,
+          updatedAt: updates.updatedAt || new Date().toISOString()
+        });
+        existingStudents.push(updatedStudent);
+      } else {
+        updatedStudent = stripServerDemoGrades({
+          ...existingStudents[index],
+          ...updates,
+          id: existingStudents[index].id || studentId,
+          savedOnline: true,
+          updatedAt: updates.updatedAt || new Date().toISOString()
+        });
+        existingStudents[index] = updatedStudent;
       }
 
-      const updatedStudent = {
-        ...existingStudents[index],
-        ...updates,
-        id: studentId,
-        savedOnline: true,
-        updatedAt: new Date().toISOString()
-      };
-
-      existingStudents[index] = updatedStudent;
       saveOnlineStudents(existingStudents);
       broadcastRealtimeEvent("student_updated", { student: updatedStudent });
 

@@ -558,7 +558,7 @@ export const BatchResultsUploadModal: React.FC<BatchResultsUploadModalProps> = (
   const [inputText, setInputText] = useState<string>('');
   const [fileName, setFileName] = useState<string>('');
   const [inputMode, setInputMode] = useState<'file' | 'paste'>('file');
-  const [uploadAssessmentScope, setUploadAssessmentScope] = useState<'tests_only' | 'full'>('tests_only');
+  const [uploadAssessmentScope, setUploadAssessmentScope] = useState<'tests_only' | 'full'>('full');
   const [singleScoreBehavior, setSingleScoreBehavior] = useState<'split' | 'ca1' | 'ca2'>('split');
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [copiedTemplate, setCopiedTemplate] = useState<string | null>(null);
@@ -858,42 +858,64 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
     let idIdx = headers.findIndex(
       h =>
         !isSerialCol(h) &&
-        (h === 'registration_no' ||
-          h === 'registration_number' ||
-          h === 'reg_no' ||
-          h === 'reg_number' ||
-          h === 'regno' ||
-          h === 'regnumber' ||
-          h === 'reg no' ||
-          h === 'registration no' ||
-          h === 'student_id' ||
-          h === 'student id' ||
-          h === 'matric_no' ||
-          h === 'matric no' ||
-          h === 'admission_no' ||
-          h === 'admission no')
+        /^(registration_no|registration_number|reg_no|reg_number|regno|regnumber|reg\s*no\.?|registration\s*no\.?|student_id|student\s*id|scholar_id|scholar\s*id|matric_no|matric\s*no|admission_no|admission\s*no|id)$/i.test(
+          h.trim()
+        )
     );
     if (idIdx < 0) {
       idIdx = headers.findIndex(
-        h => !isSerialCol(h) && (h.includes('reg') || h.includes('matric') || h.includes('student_id') || h === 'id')
+        h => !isSerialCol(h) && /\b(reg\s*no|reg_no|registration|matric|student_id|admission)\b/i.test(h.trim())
       );
     }
 
     const serialIdx = headers.findIndex(h => isSerialCol(h));
-    const nameIdx = headers.findIndex(h => (h.includes('name') && !h.includes('parent')) || h === 'student' || h === 'scholar');
-    const emailIdx = headers.findIndex(h => h.includes('email') || h.includes('mail'));
-    const gradeIdx = headers.findIndex(h => h.includes('grade') || h.includes('class') || h.includes('level'));
-    const passwordIdx = headers.findIndex(h => h === 'password' || h === 'student_password' || h === 'student password' || h === 'passcode' || h === 'pin');
+    const nameIdx = headers.findIndex(h =>
+      /^(full_name|fullname|full\s*name|student_name|student\s*name|scholar_name|scholar\s*name|name|student|scholar|candidate\s*name|candidate|pupil\s*name)$/i.test(
+        h.trim()
+      )
+    );
+    const emailIdx = headers.findIndex(h =>
+      /^(email|e-mail|email_address|email\s*address|student_email|student\s*email|mail)$/i.test(h.trim())
+    );
+    const gradeIdx = headers.findIndex(h =>
+      /^(grade_level|grade\s*level|class|class_name|class\s*name|student_class|student\s*class|arm|class\s*arm|level)$/i.test(
+        h.trim()
+      )
+    );
+    const passwordIdx = headers.findIndex(
+      h => h === 'password' || h === 'student_password' || h === 'student password' || h === 'passcode' || h === 'pin'
+    );
     const parentNameIdx = headers.findIndex(h => h.includes('parent') && h.includes('name'));
-    const parentPhoneIdx = headers.findIndex(h => h.includes('parent') && (h.includes('phone') || h.includes('mobile') || h.includes('login')));
+    const parentPhoneIdx = headers.findIndex(
+      h => h.includes('parent') && (h.includes('phone') || h.includes('mobile') || h.includes('login'))
+    );
+
+    const parseNumericScore = (rawVal: string | undefined): number => {
+      if (rawVal === undefined || rawVal === null) return 0;
+      const cleaned = String(rawVal)
+        .trim()
+        .replace(/%$/, '')
+        .replace(/\/\s*\d+(\.\d+)?$/, '')
+        .trim();
+      const n = Number(cleaned);
+      return Number.isFinite(n) ? n : 0;
+    };
 
     // Check if narrow format: contains "subject" and "score"/"ca1"/"exam" headers
     const subjectIdx = headers.findIndex(h => h === 'subject' || h === 'course' || h === 'subject_name');
     const scoreIdx = headers.findIndex(h => h === 'score' || h === 'total' || h === 'total_score' || h === 'mark');
-    const ca1Idx = headers.findIndex(h => h === 'ca1' || h === 'test1' || h === 'test 1' || h === 'ca_1' || h === '1st test' || h === '1st_test' || h === 'first test');
-    const ca2Idx = headers.findIndex(h => h === 'ca2' || h === 'test2' || h === 'test 2' || h === 'ca_2' || h === '2nd test' || h === '2nd_test' || h === 'second test');
-    const ca3Idx = headers.findIndex(h => h === 'ca3' || h === 'test3' || h === 'test 3' || h === 'ca_3' || h === '3rd test');
-    const examIdx = headers.findIndex(h => h === 'exam' || h === 'exam_score' || h === 'terminal_exam');
+    const ca1Idx = headers.findIndex(h =>
+      /^(ca\s*1|c\.?a\.?\s*1|test\s*1|ca_1|1st\s*test|1st_test|first\s*test|1st\s*ca|t1)$/i.test(h.trim())
+    );
+    const ca2Idx = headers.findIndex(h =>
+      /^(ca\s*2|c\.?a\.?\s*2|test\s*2|ca_2|2nd\s*test|2nd_test|second\s*test|2nd\s*ca|t2)$/i.test(h.trim())
+    );
+    const ca3Idx = headers.findIndex(h =>
+      /^(ca\s*3|c\.?a\.?\s*3|test\s*3|ca_3|3rd\s*test|3rd_test|third\s*test|3rd\s*ca|t3)$/i.test(h.trim())
+    );
+    const examIdx = headers.findIndex(h =>
+      /^(exam|exams|examination|exam_score|exam\s*score|terminal_exam|terminal\s*exam)$/i.test(h.trim())
+    );
 
     if (subjectIdx >= 0 && (scoreIdx >= 0 || ca1Idx >= 0 || ca2Idx >= 0 || examIdx >= 0)) {
       // Narrow format (itemized rows grouped by student registration number)
@@ -908,11 +930,22 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
         const rawGrade = gradeIdx >= 0 && cols[gradeIdx] ? cols[gradeIdx].trim() : defaultGradeFallback;
         const rawSubName = cols[subjectIdx] || 'General Subject';
         const subName = resolveCanonicalSubjectName(rawSubName);
-        const ca1 = ca1Idx >= 0 ? Number(cols[ca1Idx]) || 0 : 0;
-        const ca2 = ca2Idx >= 0 ? Number(cols[ca2Idx]) || 0 : 0;
-        const ca3 = ca3Idx >= 0 ? Number(cols[ca3Idx]) || 0 : 0;
-        const exam = examIdx >= 0 ? Number(cols[examIdx]) || 0 : (scoreIdx >= 0 && uploadAssessmentScope === 'full' ? Number(cols[scoreIdx]) : 0);
-        const total = (ca1 + ca2 + ca3 + exam) || (scoreIdx >= 0 ? Number(cols[scoreIdx]) || 0 : 0);
+
+        const hasCa1 = ca1Idx >= 0 && (cols[ca1Idx] || '').trim() !== '';
+        const hasCa2 = ca2Idx >= 0 && (cols[ca2Idx] || '').trim() !== '';
+        const hasCa3 = ca3Idx >= 0 && (cols[ca3Idx] || '').trim() !== '';
+        const hasExam = (examIdx >= 0 && (cols[examIdx] || '').trim() !== '') || (examIdx < 0 && scoreIdx >= 0 && (cols[scoreIdx] || '').trim() !== '');
+
+        const ca1 = hasCa1 ? parseNumericScore(cols[ca1Idx]) : 0;
+        const ca2 = hasCa2 ? parseNumericScore(cols[ca2Idx]) : 0;
+        const ca3 = hasCa3 ? parseNumericScore(cols[ca3Idx]) : 0;
+        const exam =
+          examIdx >= 0 && (cols[examIdx] || '').trim() !== ''
+            ? parseNumericScore(cols[examIdx])
+            : ca1Idx < 0 && ca2Idx < 0 && scoreIdx >= 0
+            ? parseNumericScore(cols[scoreIdx])
+            : 0;
+        const total = (ca1 + ca2 + ca3 + exam) || (scoreIdx >= 0 ? parseNumericScore(cols[scoreIdx]) : 0);
 
         narrowRecords.push({
           registration_no: rawId,
@@ -930,7 +963,11 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
               ca2,
               ca3,
               exam,
-              score: total
+              score: total,
+              hasCa1,
+              hasCa2,
+              hasCa3,
+              hasExam,
             }
           ]
         });
@@ -956,46 +993,48 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
         !metadataIndexes.has(idx) &&
         h &&
         !isSerialCol(h) &&
-        !['term', 'session', 'gender', 'remark', 'total', 'average', 'position', 'grade'].includes(h)
+        !['term', 'session', 'gender', 'sex', 'remark', 'remarks', 'total', 'overall_total', 'average', 'term_average', 'position', 'class_position', 'grade'].includes(h)
       ) {
         let testType: SubjectColDef['testType'] = 'composite';
-        let cleanRawName = rawH;
+        // Strip trailing weight markers like "(10)", "(20)", "(70)", "[10]", "/10", "10%" first
+        const weightStrippedH = rawH
+          .replace(/[\(\[]\s*\d+(\.\d+)?\s*%?\s*(?:marks?|pts?|points?)?\s*[\)\]]/gi, '')
+          .replace(/\/\s*\d+(\.\d+)?\s*$/g, '')
+          .trim();
+        let cleanRawName = weightStrippedH;
 
-        const ca1Regex = /(\(\s*(?:1st\s*test|test\s*1|first\s*test|ca\s*1|1st\s*ca|t\s*1)\s*\)|\[(?:1st\s*test|test\s*1|ca\s*1|t1)\]|\b(?:1st\s*test|test\s*1|first\s*test|ca\s*1|1st\s*ca|t1)\b)$/i;
-        const ca2Regex = /(\(\s*(?:2nd\s*test|test\s*2|second\s*test|ca\s*2|2nd\s*ca|t\s*2)\s*\)|\[(?:2nd\s*test|test\s*2|ca\s*2|t2)\]|\b(?:2nd\s*test|test\s*2|second\s*test|ca\s*2|2nd\s*ca|t2)\b)$/i;
-        const ca3Regex = /(\(\s*(?:3rd\s*test|test\s*3|third\s*test|ca\s*3|3rd\s*ca|t\s*3)\s*\)|\[(?:3rd\s*test|test\s*3|ca\s*3|t3)\]|\b(?:3rd\s*test|test\s*3|third\s*test|ca\s*3|3rd\s*ca|t3)\b)$/i;
-        const examRegex = /(\(\s*(?:terminal\s*exam|exam\s*score|exam)\s*\)|\[(?:terminal\s*exam|exam)\]|\b(?:terminal\s*exam|exam\s*score|exam)\b)$/i;
+        const ca1Regex = /(\(\s*(?:1st\s*test|test\s*1|first\s*test|c\.?a\.?\s*1|1st\s*c\.?a\.?|t\s*1)\s*\)|\[(?:1st\s*test|test\s*1|c\.?a\.?\s*1|t1)\]|\b(?:1st\s*test|1st_test|test\s*1|test_1|first\s*test|c\.?a\.?\s*1|ca_1|1st\s*c\.?a\.?|t1)\b)/i;
+        const ca2Regex = /(\(\s*(?:2nd\s*test|test\s*2|second\s*test|c\.?a\.?\s*2|2nd\s*c\.?a\.?|t\s*2)\s*\)|\[(?:2nd\s*test|test\s*2|c\.?a\.?\s*2|t2)\]|\b(?:2nd\s*test|2nd_test|test\s*2|test_2|second\s*test|c\.?a\.?\s*2|ca_2|2nd\s*c\.?a\.?|t2)\b)/i;
+        const ca3Regex = /(\(\s*(?:3rd\s*test|test\s*3|third\s*test|c\.?a\.?\s*3|3rd\s*c\.?a\.?|t\s*3)\s*\)|\[(?:3rd\s*test|test\s*3|c\.?a\.?\s*3|t3)\]|\b(?:3rd\s*test|3rd_test|test\s*3|test_3|third\s*test|c\.?a\.?\s*3|ca_3|3rd\s*c\.?a\.?|t3)\b)/i;
+        const examRegex = /(\(\s*(?:terminal\s*exam(?:ination)?|exam(?:ination)?\s*score|exams?|examination)\s*\)|\[(?:terminal\s*exam|exams?|examination)\]|\b(?:terminal\s*exam(?:ination)?|terminal_exam|exam_score|exam\s*score|exams?|examination)\b)/i;
 
-        if (ca1Regex.test(rawH) || /\b(test\s*1|ca\s*1|1st\s*test|1st\s*ca|t1)\b/i.test(rawH)) {
+        if (ca1Regex.test(weightStrippedH)) {
           testType = 'ca1';
-          cleanRawName = rawH
+          cleanRawName = weightStrippedH
             .replace(ca1Regex, '')
-            .replace(/\b(test\s*1|ca\s*1|1st\s*test|1st\s*ca|t1)\b/gi, '')
-            .replace(/[()_[\]-]+$/g, '')
-            .replace(/^[()_[\]-]+/g, '')
+            .replace(/[()_[\]\-–—:]+$/g, '')
+            .replace(/^[()_[\]\-–—:]+/g, '')
             .trim();
-        } else if (ca2Regex.test(rawH) || /\b(test\s*2|ca\s*2|2nd\s*test|2nd\s*ca|t2)\b/i.test(rawH)) {
+        } else if (ca2Regex.test(weightStrippedH)) {
           testType = 'ca2';
-          cleanRawName = rawH
+          cleanRawName = weightStrippedH
             .replace(ca2Regex, '')
-            .replace(/\b(test\s*2|ca\s*2|2nd\s*test|2nd\s*ca|t2)\b/gi, '')
-            .replace(/[()_[\]-]+$/g, '')
-            .replace(/^[()_[\]-]+/g, '')
+            .replace(/[()_[\]\-–—:]+$/g, '')
+            .replace(/^[()_[\]\-–—:]+/g, '')
             .trim();
-        } else if (ca3Regex.test(rawH) || /\b(test\s*3|ca\s*3|3rd\s*test|3rd\s*ca|t3)\b/i.test(rawH)) {
+        } else if (ca3Regex.test(weightStrippedH)) {
           testType = 'ca3';
-          cleanRawName = rawH
+          cleanRawName = weightStrippedH
             .replace(ca3Regex, '')
-            .replace(/\b(test\s*3|ca\s*3|3rd\s*test|3rd\s*ca|t3)\b/gi, '')
-            .replace(/[()_[\]-]+$/g, '')
-            .replace(/^[()_[\]-]+/g, '')
+            .replace(/[()_[\]\-–—:]+$/g, '')
+            .replace(/^[()_[\]\-–—:]+/g, '')
             .trim();
-        } else if (examRegex.test(rawH)) {
+        } else if (examRegex.test(weightStrippedH)) {
           testType = 'exam';
-          cleanRawName = rawH
+          cleanRawName = weightStrippedH
             .replace(examRegex, '')
-            .replace(/[()_[\]-]+$/g, '')
-            .replace(/^[()_[\]-]+/g, '')
+            .replace(/[()_[\]\-–—:]+$/g, '')
+            .replace(/^[()_[\]\-–—:]+/g, '')
             .trim();
         }
 
@@ -1037,60 +1076,98 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
         let ca3 = 0;
         let exam = 0;
         let hasValues = false;
+        let hasCa1 = false;
+        let hasCa2 = false;
+        let hasCa3 = false;
+        let hasExam = false;
 
         const ca1Col = groupCols.find(c => c.testType === 'ca1');
         const ca2Col = groupCols.find(c => c.testType === 'ca2');
         const ca3Col = groupCols.find(c => c.testType === 'ca3');
         const examCol = groupCols.find(c => c.testType === 'exam');
-        const compositeCol = groupCols.find(c => c.testType === 'composite');
+        const compositeCols = groupCols.filter(c => c.testType === 'composite');
 
         if (ca1Col || ca2Col || ca3Col || examCol) {
           // Explicit 1st Test / 2nd Test / Exam columns
           if (ca1Col && cols[ca1Col.index] !== undefined && cols[ca1Col.index].trim() !== '') {
-            ca1 = Number(cols[ca1Col.index]) || 0;
+            ca1 = parseNumericScore(cols[ca1Col.index]);
+            hasCa1 = true;
             hasValues = true;
           }
           if (ca2Col && cols[ca2Col.index] !== undefined && cols[ca2Col.index].trim() !== '') {
-            ca2 = Number(cols[ca2Col.index]) || 0;
+            ca2 = parseNumericScore(cols[ca2Col.index]);
+            hasCa2 = true;
             hasValues = true;
           }
           if (ca3Col && cols[ca3Col.index] !== undefined && cols[ca3Col.index].trim() !== '') {
-            ca3 = Number(cols[ca3Col.index]) || 0;
+            ca3 = parseNumericScore(cols[ca3Col.index]);
+            hasCa3 = true;
             hasValues = true;
           }
           if (examCol && cols[examCol.index] !== undefined && cols[examCol.index].trim() !== '') {
-            exam = Number(cols[examCol.index]) || 0;
+            exam = parseNumericScore(cols[examCol.index]);
+            hasExam = true;
             hasValues = true;
           }
-        } else if (compositeCol) {
-          // Single subject column (e.g. "10/10" for 1st Test / 2nd Test or single score)
-          const valStr = (cols[compositeCol.index] || '').trim();
+          // If there is ALSO a composite column alongside CA columns (e.g. "Mathematics 1st Test", "Mathematics 2nd Test", "Mathematics" as Exam/Total)
+          if (!hasExam && compositeCols.length > 0) {
+            const compValStr = (cols[compositeCols[0].index] || '').trim();
+            if (compValStr !== '') {
+              const compNum = parseNumericScore(compValStr);
+              // If compNum looks like a total (> 70 and ca1+ca2 > 0), subtract ca1+ca2+ca3; otherwise treat as exam score
+              if (compNum > 70 && ca1 + ca2 + ca3 > 0 && compNum >= ca1 + ca2 + ca3) {
+                exam = compNum - (ca1 + ca2 + ca3);
+              } else {
+                exam = compNum;
+              }
+              hasExam = true;
+              hasValues = true;
+            }
+          }
+        } else if (compositeCols.length > 0) {
+          // Single subject column (e.g. "10/10/55" or "10/10" or single total score)
+          const valStr = (cols[compositeCols[0].index] || '').trim();
           if (valStr !== '') {
             hasValues = true;
-            if (valStr.includes('/') || valStr.includes(',') || valStr.includes('+') || valStr.includes('-')) {
-              const parts = valStr.split(/[/,+-]|\s+/).filter(Boolean).map(p => Number(p.trim()) || 0);
+            if (valStr.includes('/') || valStr.includes(',') || valStr.includes('+') || (valStr.includes('-') && !valStr.startsWith('-'))) {
+              const parts = valStr.split(/[/,+-]|\s+/).filter(Boolean).map(p => parseNumericScore(p));
               ca1 = parts[0] || 0;
               ca2 = parts[1] || 0;
-              if (parts.length >= 3) {
+              hasCa1 = true;
+              hasCa2 = parts.length >= 2;
+              if (parts.length === 3) {
                 exam = parts[2] || 0;
+                hasExam = true;
+              } else if (parts.length >= 4) {
+                ca3 = parts[2] || 0;
+                exam = parts[3] || 0;
+                hasCa3 = true;
+                hasExam = true;
               }
             } else {
-              const scoreNum = Number(valStr) || 0;
-              if (uploadAssessmentScope === 'tests_only') {
+              const scoreNum = parseNumericScore(valStr);
+              if (uploadAssessmentScope === 'tests_only' && scoreNum <= 30) {
                 if (singleScoreBehavior === 'split') {
                   ca1 = Math.round(scoreNum / 2);
                   ca2 = Math.floor(scoreNum / 2);
+                  hasCa1 = true;
+                  hasCa2 = true;
                 } else if (singleScoreBehavior === 'ca1') {
                   ca1 = scoreNum;
                   ca2 = 0;
+                  hasCa1 = true;
                 } else {
                   ca1 = 0;
                   ca2 = scoreNum;
+                  hasCa2 = true;
                 }
               } else {
-                ca1 = Math.round(scoreNum * 0.2);
-                ca2 = Math.round(scoreNum * 0.2);
-                exam = Math.round(scoreNum * 0.6);
+                ca1 = Math.round(scoreNum * 0.15);
+                ca2 = Math.round(scoreNum * 0.15);
+                exam = scoreNum - ca1 - ca2;
+                hasCa1 = true;
+                hasCa2 = true;
+                hasExam = true;
               }
             }
           }
@@ -1098,7 +1175,18 @@ SBS/2026/NEW02,Tunde Bakare,SSS 1 Science,${row3}`;
 
         if (hasValues) {
           const total = ca1 + ca2 + ca3 + exam;
-          results.push({ subject: subName, ca1, ca2, ca3, exam, score: total });
+          results.push({
+            subject: subName,
+            ca1,
+            ca2,
+            ca3,
+            exam,
+            score: total,
+            hasCa1,
+            hasCa2,
+            hasCa3,
+            hasExam,
+          });
         }
       });
 

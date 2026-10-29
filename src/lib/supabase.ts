@@ -345,10 +345,47 @@ export const checkRemoteAdminStatus = async (): Promise<boolean> => {
 // After a remote-verified login, hydrate (now including private collections
 // unlocked by the session token) then reload so every mounted state picks up
 // the shared data. The portal section is stashed so App lands back in it.
-export const completeRemoteLogin = async (token: string, targetSection: string): Promise<never> => {
+export const completeRemoteLogin = async (
+  token: string,
+  targetSection: string,
+  refId?: string,
+  loginIdentifier?: string
+): Promise<never> => {
   setDbSession(token);
   try { sessionStorage.setItem('stanbax_resume_section', targetSection); } catch { /* ignore */ }
   await hydrateFromSupabase();
+  if (targetSection === 'student-portal') {
+    try {
+      const savedStudentsRaw = localStorage.getItem('stanbax_students');
+      if (savedStudentsRaw) {
+        const list = JSON.parse(savedStudentsRaw);
+        if (Array.isArray(list)) {
+          const cleanLogin = String(loginIdentifier || '').trim().toLowerCase();
+          const normLogin = normalizeRegForUpsert(cleanLogin);
+          const normRef = normalizeRegForUpsert(refId || '');
+          const matched = list.find((s: any) => {
+            if (!s) return false;
+            if (refId && String(s.id || '').toLowerCase() === String(refId).toLowerCase()) return true;
+            const sRegNorm = normalizeRegForUpsert(s.regNumber);
+            if (normLogin && sRegNorm && sRegNorm === normLogin) return true;
+            if (normRef && sRegNorm && sRegNorm === normRef) return true;
+            if (cleanLogin && String(s.email || '').toLowerCase().trim() === cleanLogin) return true;
+            if (cleanLogin && String(s.name || '').toLowerCase().trim() === cleanLogin) return true;
+            return false;
+          });
+          if (matched) {
+            localStorage.setItem('stanbax_student_id', matched.id);
+            sessionStorage.setItem('stanbax_student_id', matched.id);
+            if (matched.regNumber) {
+              localStorage.setItem('stanbax_student_reg', matched.regNumber);
+              sessionStorage.setItem('stanbax_student_reg', matched.regNumber);
+            }
+            sessionStorage.setItem('stanbax_active_student_cache', JSON.stringify(matched));
+          }
+        }
+      }
+    } catch { /* ignore */ }
+  }
   window.location.reload();
   // unreachable in a real browser, but satisfies typing in tests
   return new Promise<never>(() => {});
@@ -367,7 +404,9 @@ export const remoteChangePassword = async (
   oldPassword: string | null,
   newPassword: string
 ): Promise<{ ok: boolean; message?: string }> => {
-  if (!supabase || !sessionToken) return { ok: false, message: 'Supabase offline or no session.' };
+  if (!supabase) return { ok: false, message: 'Supabase offline.' };
+  if (!sessionToken) await ensureAdminRemoteSession();
+  if (!sessionToken) return { ok: false, message: 'No active session.' };
   try {
     const { data, error } = await supabase.rpc('change_password', {
       p_identifier: identifier,
@@ -392,15 +431,34 @@ export const remoteCreateCredential = async (
   refId: string,
   aliases: string[] = []
 ): Promise<{ ok: boolean; message?: string }> => {
-  if (!supabase || !sessionToken) return { ok: false, message: 'Supabase offline or no session.' };
+  if (!supabase) return { ok: false, message: 'Supabase offline.' };
+  if (!sessionToken) {
+    await ensureAdminRemoteSession();
+  }
+  if (!sessionToken) return { ok: false, message: 'Supabase offline or no session.' };
   try {
-    const { data, error } = await supabase.rpc('create_credential', {
+    let { data, error } = await supabase.rpc('create_credential', {
       p_identifier: identifier,
       p_password: password,
       p_role: role,
       p_ref_id: refId,
       p_aliases: aliases,
     });
+    if (error || (data && (data as any).ok === false)) {
+      setDbSession(null);
+      const reauthed = await ensureAdminRemoteSession();
+      if (reauthed) {
+        const retry = await supabase.rpc('create_credential', {
+          p_identifier: identifier,
+          p_password: password,
+          p_role: role,
+          p_ref_id: refId,
+          p_aliases: aliases,
+        });
+        data = retry.data;
+        error = retry.error;
+      }
+    }
     if (error) {
       console.warn('[Supabase Security] Credential creation unauthorized:', error.message);
       return { ok: false, message: error.message };
@@ -474,6 +532,69 @@ export const markLocalMutation = (): void => {
 };
 export const hasPendingRemoteWrites = (): boolean => pendingWrites.size > 0;
 
+export const setLocalStorageSilent = (key: string, value: string): void => {
+  if (typeof localStorage === 'undefined') return;
+  const prev = suppressRemote;
+  suppressRemote = true;
+  try {
+    localStorage.setItem(key, value);
+  } catch {} finally {
+    suppressRemote = prev;
+  }
+};
+
+export const isSeededDemoGrade = (g: any): boolean => {
+  if (!g) return false;
+  if (g.isRealScore === true) return false;
+  const id = String(g.id || '').trim();
+  if (/^(j?grd-\d+|grd-stu-\d+-\d+|grd-.*-h\d-\d+)$/i.test(id)) return true;
+  if (g.color === '#16a34a') return true;
+  return false;
+};
+
+export const stripDemoGradesFromStudent = <T extends Record<string, any>>(stu: T): T => {
+  if (!stu || typeof stu !== 'object') return stu;
+  const rawGrades = Array.isArray(stu.grades) ? stu.grades : [];
+  const filteredGrades = rawGrades.filter((g: any) => g && g.subject && !isSeededDemoGrade(g));
+  const hadDemoGrades = filteredGrades.length !== rawGrades.length;
+
+  let nextCollated = stu.lastCollatedResult;
+  if (nextCollated && Array.isArray(nextCollated.grades)) {
+    const cleanCollatedGrades = nextCollated.grades.filter((g: any) => g && g.subject && !isSeededDemoGrade(g));
+    if (cleanCollatedGrades.length !== nextCollated.grades.length) {
+      const colAvg =
+        cleanCollatedGrades.length > 0
+          ? Math.round((cleanCollatedGrades.reduce((s: number, x: any) => s + (Number(x.total) || 0), 0) / cleanCollatedGrades.length) * 10) / 10
+          : 0;
+      nextCollated = {
+        ...nextCollated,
+        grades: cleanCollatedGrades,
+        termAverage: colAvg,
+        annualAverage: colAvg,
+      };
+    }
+  }
+
+  if (!hadDemoGrades && nextCollated === stu.lastCollatedResult) {
+    return stu;
+  }
+
+  const newAvg =
+    filteredGrades.length > 0
+      ? Math.round((filteredGrades.reduce((s: number, x: any) => s + (Number(x.total) || 0), 0) / filteredGrades.length) * 10) / 10
+      : 0;
+
+  return {
+    ...stu,
+    grades: filteredGrades,
+    termAverage: newAvg,
+    ...(hadDemoGrades && filteredGrades.length === 0
+      ? { term1Average: 0, cumulativeAnnualAverage: 0 }
+      : {}),
+    lastCollatedResult: nextCollated,
+  };
+};
+
 export const deduplicateStudentsByRegistration = <T extends Record<string, any>>(
   studentsList: T[],
   deletedSet?: Set<string>
@@ -491,7 +612,10 @@ export const deduplicateStudentsByRegistration = <T extends Record<string, any>>
     return Math.max(Number.isFinite(t1) ? t1 : 0, Number.isFinite(t2) ? t2 : 0);
   };
 
-  const mergeStudentRecords = (existing: T, incoming: T): T => {
+  const mergeStudentRecords = (rawExisting: T, rawIncoming: T): T => {
+    const existing = stripDemoGradesFromStudent(rawExisting);
+    const incoming = stripDemoGradesFromStudent(rawIncoming);
+
     const preferExistingId =
       existing.id &&
       (!String(existing.id).startsWith('std-batch-') || String(incoming.id || '').startsWith('std-batch-'));
@@ -502,22 +626,37 @@ export const deduplicateStudentsByRegistration = <T extends Record<string, any>>
     const incomingTs = getRecordTimestamp(incoming);
     const incomingIsNewerOrEqual = incomingTs >= existingTs;
 
-    // Merge grades by subject name (case-insensitive)
-    const gradeMap = new Map<string, any>();
-    const baseGrades = incomingIsNewerOrEqual
-      ? (Array.isArray(existing.grades) ? existing.grades : [])
-      : (Array.isArray(incoming.grades) ? incoming.grades : []);
-    const overlayGrades = incomingIsNewerOrEqual
-      ? (Array.isArray(incoming.grades) ? incoming.grades : [])
-      : (Array.isArray(existing.grades) ? existing.grades : []);
+    const primary = incomingIsNewerOrEqual ? incoming : existing;
+    const secondary = incomingIsNewerOrEqual ? existing : incoming;
 
-    for (const g of baseGrades) {
-      if (g && g.subject) {
-        gradeMap.set(String(g.subject).toLowerCase().trim(), { ...g });
+    const primaryGrades: any[] = Array.isArray(primary.grades) ? primary.grades : [];
+    const secondaryGrades: any[] = Array.isArray(secondary.grades) ? secondary.grades : [];
+
+    const primaryHasRealUpload =
+      Boolean(primary.hasUploadedResults) ||
+      primaryGrades.some(g => g?.isRealScore === true) ||
+      primaryTs > 0;
+
+    // Merge grades by subject name (case-insensitive), preferring primary's authoritative grades
+    const gradeMap = new Map<string, any>();
+
+    if (!primaryHasRealUpload) {
+      for (const g of secondaryGrades) {
+        if (g && g.subject && !isSeededDemoGrade(g)) {
+          gradeMap.set(String(g.subject).toLowerCase().trim(), { ...g });
+        }
+      }
+    } else {
+      // Only carry over secondary grades that were explicitly marked as real uploaded scores
+      for (const g of secondaryGrades) {
+        if (g && g.subject && g.isRealScore === true && !isSeededDemoGrade(g)) {
+          gradeMap.set(String(g.subject).toLowerCase().trim(), { ...g });
+        }
       }
     }
-    for (const g of overlayGrades) {
-      if (g && g.subject) {
+
+    for (const g of primaryGrades) {
+      if (g && g.subject && !isSeededDemoGrade(g)) {
         const key = String(g.subject).toLowerCase().trim();
         const prev = gradeMap.get(key);
         if (prev) {
@@ -529,8 +668,8 @@ export const deduplicateStudentsByRegistration = <T extends Record<string, any>>
           gradeMap.set(key, {
             ...prev,
             ...g,
-            id: prev.id || g.id,
-            subject: prev.subject || g.subject,
+            id: g.id || prev.id,
+            subject: g.subject || prev.subject,
             ca1,
             ca2,
             ca3,
@@ -547,10 +686,24 @@ export const deduplicateStudentsByRegistration = <T extends Record<string, any>>
     const termAverage =
       mergedGrades.length > 0
         ? Math.round((mergedGrades.reduce((sum, item) => sum + (Number(item.total) || 0), 0) / mergedGrades.length) * 10) / 10
-        : Number((incomingIsNewerOrEqual ? incoming.termAverage : existing.termAverage) || incoming.termAverage || existing.termAverage || 0);
+        : 0;
 
-    const primary = incomingIsNewerOrEqual ? incoming : existing;
-    const secondary = incomingIsNewerOrEqual ? existing : incoming;
+    const resolvedName =
+      primary.name && !String(primary.name).startsWith('Student ')
+        ? primary.name
+        : secondary.name && !String(secondary.name).startsWith('Student ')
+        ? secondary.name
+        : primary.name || secondary.name;
+
+    const rawCollated = primary.lastCollatedResult || secondary.lastCollatedResult;
+    const resolvedCollated = rawCollated
+      ? {
+          ...rawCollated,
+          grades: mergedGrades,
+          termAverage,
+          annualAverage: termAverage,
+        }
+      : undefined;
 
     return {
       ...secondary,
@@ -558,16 +711,18 @@ export const deduplicateStudentsByRegistration = <T extends Record<string, any>>
       id: canonicalId,
       regNumber: canonicalReg,
       password: primary.password || secondary.password || 'stanbax2025',
-      name: primary.name && !String(primary.name).startsWith('Student ') ? primary.name : (secondary.name || primary.name),
+      name: resolvedName,
       grades: mergedGrades,
       termAverage,
-      lastCollatedResult: primary.lastCollatedResult || secondary.lastCollatedResult,
+      hasUploadedResults: Boolean(primary.hasUploadedResults || secondary.hasUploadedResults || mergedGrades.some(g => g?.isRealScore)),
+      lastCollatedResult: resolvedCollated,
       updatedAt: primary.updatedAt || secondary.updatedAt,
     };
   };
 
-  for (const s of studentsList) {
-    if (!s || (!s.id && !s.regNumber)) continue;
+  for (const rawS of studentsList) {
+    if (!rawS || (!rawS.id && !rawS.regNumber)) continue;
+    const s = stripDemoGradesFromStudent(rawS);
     const idKey = String(s.id || '').toLowerCase().trim();
     const regKey = normalizeRegForUpsert(s.regNumber);
     const rawRegLower = String(s.regNumber || '').toLowerCase().replace(/\s+/g, '');
@@ -679,23 +834,26 @@ const buildPublicMirrorItems = (): Array<{ key: string; data: unknown }> => {
   return mirrors;
 };
 
+const isBrowserAdminAuthorized = (): boolean => {
+  if (typeof localStorage === 'undefined') return false;
+  return (
+    localStorage.getItem('stanbax_admin_auth') === 'true' ||
+    (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('stanbax_admin_auth') === 'true') ||
+    localStorage.getItem('stanbax_proprietress_auth') === 'true' ||
+    (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('stanbax_proprietress_auth') === 'true') ||
+    localStorage.getItem('stanbax_headmistress_auth') === 'true' ||
+    localStorage.getItem('stanbax_moderator_auth') === 'true' ||
+    localStorage.getItem('stanbax_tutor_auth') === 'true'
+  );
+};
+
 const flushWrites = async () => {
   flushTimer = null;
   if (!supabase) { pendingWrites.clear(); return; }
 
-  // If no sessionToken yet, attempt to auto-establish an Admin DB session if admin is logged in or writing core school state
-  if (!sessionToken) {
-    const hasCoreWrites =
-      pendingWrites.has('stanbax_students') ||
-      pendingWrites.has('stanbax_subjects') ||
-      pendingWrites.has('stanbax_assessment_config') ||
-      pendingWrites.has('stanbax_deleted_account_ids') ||
-      pendingWrites.has('stanbax_parents_list') ||
-      pendingWrites.has('stanbax_tutors') ||
-      (typeof localStorage !== 'undefined' && localStorage.getItem('stanbax_admin_auth') === 'true');
-    if (hasCoreWrites) {
-      await ensureAdminRemoteSession();
-    }
+  // Only auto-establish an Admin DB session if an authorized staff/admin portal is active in this browser
+  if (!sessionToken && isBrowserAdminAuthorized()) {
+    await ensureAdminRemoteSession();
   }
 
   // If still no authenticated sessionToken (e.g., anonymous parent on landing page),
@@ -762,7 +920,7 @@ const flushWrites = async () => {
   try {
     if (upserts.length) {
       let { error } = await supabase.rpc('put_states', { p_items: upserts });
-      if (error && error.message?.includes('Not signed in')) {
+      if (error && isBrowserAdminAuthorized()) {
         setDbSession(null);
         const reauthed = await ensureAdminRemoteSession();
         if (reauthed) {
@@ -894,8 +1052,9 @@ export const hydrateFromSupabase = async (): Promise<void> => {
         if (Array.isArray(footerMirror.chatMessages) && !rowMap.has('stanbax_chat_messages')) {
           localStorage.setItem('stanbax_chat_messages', JSON.stringify(footerMirror.chatMessages));
         }
-        if (Array.isArray(footerMirror.students) && !rowMap.has('stanbax_students')) {
-          const cleanStu = deduplicateStudentsByRegistration(footerMirror.students, deletedSet);
+        if (Array.isArray(footerMirror.students)) {
+          const directStu = Array.isArray(rowMap.get('stanbax_students')) ? rowMap.get('stanbax_students') : [];
+          const cleanStu = deduplicateStudentsByRegistration([...footerMirror.students, ...directStu], deletedSet);
           localStorage.setItem('stanbax_students', JSON.stringify(cleanStu));
         }
         if (Array.isArray(footerMirror.tutors) && !rowMap.has('stanbax_tutors')) {
@@ -1185,7 +1344,12 @@ export const syncNewDataTypesOnline = async (payload: {
 
 export const ensureAdminRemoteSession = async (password?: string): Promise<boolean> => {
   if (!supabase) return false;
-  if (sessionToken) return true;
+  if (sessionToken) {
+    const isAdmin = await checkRemoteAdminStatus();
+    if (isAdmin) return true;
+    // Current sessionToken is either expired or belongs to a non-admin role (e.g. student)
+    setDbSession(null);
+  }
   const savedAdminPass =
     typeof localStorage !== 'undefined' ? localStorage.getItem('stanbax_admin_password') || undefined : undefined;
   const candidates = Array.from(
@@ -1375,9 +1539,15 @@ export const fetchLiveSupabaseChatAndDirectoryState = async (): Promise<{
       resolvedAssessment = mirrorDisp > directDisp ? mirrorAssessment : directAssessment;
     }
 
-    const rawStu =
-      map.get('stanbax_students') ||
-      (footerMirror?.__type === 'PUBLIC_COMMUNITY_MIRROR' ? footerMirror.students : undefined);
+    const directStudents = Array.isArray(map.get('stanbax_students')) ? map.get('stanbax_students') : [];
+    const mirrorStudents =
+      footerMirror?.__type === 'PUBLIC_COMMUNITY_MIRROR' && Array.isArray(footerMirror.students)
+        ? footerMirror.students
+        : [];
+    const combinedRawStu =
+      directStudents.length > 0 || mirrorStudents.length > 0
+        ? [...mirrorStudents, ...directStudents]
+        : undefined;
 
     return {
       visitorConversations: mergedConvs,
@@ -1388,7 +1558,7 @@ export const fetchLiveSupabaseChatAndDirectoryState = async (): Promise<{
       chatMessages:
         map.get('stanbax_chat_messages') ||
         (footerMirror?.__type === 'PUBLIC_COMMUNITY_MIRROR' ? footerMirror.chatMessages : undefined),
-      students: Array.isArray(rawStu) ? deduplicateStudentsByRegistration(rawStu, deletedSet) : undefined,
+      students: Array.isArray(combinedRawStu) ? deduplicateStudentsByRegistration(combinedRawStu, deletedSet) : undefined,
       tutors:
         map.get('stanbax_tutors') ||
         (footerMirror?.__type === 'PUBLIC_COMMUNITY_MIRROR' ? footerMirror.tutors : undefined),
@@ -1435,22 +1605,22 @@ export const forceSyncCollatedResultsToDatabase = async (payload: {
     ? deduplicateStudentsByRegistration(payload.students)
     : payload.students;
   try {
-    localStorage.setItem('stanbax_students', JSON.stringify(cleanStudents));
-    localStorage.setItem('stanbax_assessment_config', JSON.stringify(payload.assessmentConfig));
+    setLocalStorageSilent('stanbax_students', JSON.stringify(cleanStudents));
+    setLocalStorageSilent('stanbax_assessment_config', JSON.stringify(payload.assessmentConfig));
     if (payload.subjects !== undefined) {
-      localStorage.setItem('stanbax_subjects', JSON.stringify(payload.subjects));
+      setLocalStorageSilent('stanbax_subjects', JSON.stringify(payload.subjects));
     }
     if (payload.parents !== undefined) {
-      localStorage.setItem('stanbax_parents_list', JSON.stringify(payload.parents));
+      setLocalStorageSilent('stanbax_parents_list', JSON.stringify(payload.parents));
     }
     if (payload.deletedAccountIds !== undefined) {
-      localStorage.setItem('stanbax_deleted_account_ids', JSON.stringify(payload.deletedAccountIds));
+      setLocalStorageSilent('stanbax_deleted_account_ids', JSON.stringify(payload.deletedAccountIds));
     }
     if (payload.gradingSystem !== undefined) {
-      localStorage.setItem('stanbax_grading_system', JSON.stringify(payload.gradingSystem));
+      setLocalStorageSilent('stanbax_grading_system', JSON.stringify(payload.gradingSystem));
     }
     if (payload.officialSignatures !== undefined) {
-      localStorage.setItem('stanbax_official_signatures', JSON.stringify(payload.officialSignatures));
+      setLocalStorageSilent('stanbax_official_signatures', JSON.stringify(payload.officialSignatures));
     }
   } catch {}
 
@@ -1463,9 +1633,7 @@ export const forceSyncCollatedResultsToDatabase = async (payload: {
   }
 
   try {
-    if (!sessionToken) {
-      await ensureAdminRemoteSession(payload.adminPassword);
-    }
+    await ensureAdminRemoteSession(payload.adminPassword);
 
     const items: Array<{ key: string; data: unknown }> = [
       { key: 'stanbax_students', data: cleanStudents },
@@ -1514,7 +1682,7 @@ export const forceSyncCollatedResultsToDatabase = async (payload: {
 
     if (sessionToken) {
       let { error } = await supabase.rpc('put_states', { p_items: items });
-      if (error && error.message?.includes('Not signed in')) {
+      if (error) {
         setDbSession(null);
         const reauthed = await ensureAdminRemoteSession(payload.adminPassword);
         if (reauthed) {
